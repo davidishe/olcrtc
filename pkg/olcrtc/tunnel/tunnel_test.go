@@ -12,15 +12,16 @@ var errNo = errors.New("no")
 
 func TestRun_FailsWithoutKey(t *testing.T) {
 	tunnel.RegisterDefaults()
-	err := tunnel.New(tunnel.Config{
+	srv, err := tunnel.New(tunnel.Config{
 		Transport: "datachannel",
 		Carrier:   "telemost",
 		RoomURL:   "room-1",
 		DNSServer: "8.8.8.8:53",
-	}).Run(context.Background())
+	})
 	if err == nil {
-		t.Fatal("Run(no key) error = nil")
+		t.Fatal("New(no key) error = nil")
 	}
+	_ = srv
 }
 
 func TestRun_PropagatesAuthHook(_ *testing.T) {
@@ -28,17 +29,43 @@ func TestRun_PropagatesAuthHook(_ *testing.T) {
 
 	var called bool
 	cfg := tunnel.Config{
+		KeyHex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		AuthHook: func(string, map[string]any) (string, error) {
 			called = true
 			return "", errNo
 		},
 	}
-	_ = tunnel.New(cfg).Run(context.Background())
-	// Run bails before ever invoking AuthHook (no key, no carrier wired); this
-	// test exists to pin the public surface and ensure the hook field compiles
-	// against the re-exported handshake.AuthFunc type alias. Behavior coverage
-	// of AuthHook itself lives in internal/handshake tests.
+	srv, err := tunnel.New(cfg)
+	if err != nil {
+		// construction may still fail without transport wiring; surface is what matters
+		_ = err
+		return
+	}
+	_ = srv.Run(context.Background())
 	_ = called
+}
+
+func TestDisconnectAPISurface(t *testing.T) {
+	tunnel.RegisterDefaults()
+	srv, err := tunnel.New(tunnel.Config{
+		KeyHex:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Transport: "datachannel",
+		Carrier:   "jitsi",
+		RoomURL:   "https://example.test/room",
+		DNSServer: "8.8.8.8:53",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if n := srv.DisconnectDevice("missing"); n != 0 {
+		t.Fatalf("DisconnectDevice = %d", n)
+	}
+	if err := srv.DisconnectSession("missing"); err == nil {
+		t.Fatal("expected session not found")
+	}
+	if got := srv.ActiveSessions(); len(got) != 0 {
+		t.Fatalf("ActiveSessions = %d", len(got))
+	}
 }
 
 // Compile-time checks: the public type aliases must be assignable.

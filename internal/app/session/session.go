@@ -203,6 +203,14 @@ type Config struct {
 	TrafficMinDelay       string
 	TrafficMaxDelay       string
 	Amount                int
+
+	// DeviceID and AccessToken are sent in CLIENT_HELLO for Cockney multi-user auth.
+	DeviceID    string
+	AccessToken string
+
+	// SubscriptionURL enables Cockney subscription bootstrap/refresh (client mode).
+	SubscriptionURL      string
+	SubscriptionRefresh  string
 }
 
 // RegisterDefaults registers built-in carriers and transports.
@@ -678,6 +686,10 @@ func runOnce(
 		}
 		return nil
 	case modeCNC:
+		claims := map[string]any(nil)
+		if cfg.AccessToken != "" {
+			claims = map[string]any{"access_token": cfg.AccessToken}
+		}
 		if err := client.Run(ctx, client.Config{
 			Transport:        cfg.Transport,
 			Carrier:          cfg.Auth,
@@ -695,6 +707,8 @@ func runOnce(
 			AuthToken:        cfg.AuthToken,
 			Liveness:         liveness,
 			Traffic:          traffic,
+			DeviceID:         cfg.DeviceID,
+			Claims:           claims,
 		}); err != nil {
 			return fmt.Errorf("client: %w", err)
 		}

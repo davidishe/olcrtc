@@ -4,30 +4,19 @@
 // and proxies their traffic to arbitrary TCP targets. Consumers plug in
 // authorization and observability via the [Config] hooks:
 //
-//	srv := tunnel.New(tunnel.Config{
+//	srv, err := tunnel.New(tunnel.Config{
 //	    Transport: "datachannel",
 //	    Carrier:   "jitsi",
-//	    // Use meet.small-dm.ru, meet1.arbitr.ru, or meet.handyweb.org - whichever works in your network
 //	    RoomURL:   "https://meet.small-dm.ru/myroom",
 //	    KeyHex:    "<64-char hex>",
 //	    DNSServer: "8.8.8.8:53",
 //	    AuthHook: func(deviceID string, claims map[string]any) (string, error) {
-//	        // reject unknown devices, enrich session with a DB-issued ID
 //	        return db.IssueSession(deviceID, claims)
 //	    },
-//	    OnSessionOpen: func(sid, dev string, claims map[string]any) {
-//	        log.Printf("session %s opened (device=%s)", sid, dev)
-//	    },
-//	    OnSessionClose: func(sid, reason string) {
-//	        log.Printf("session %s closed (%s)", sid, reason)
-//	    },
-//	    OnTraffic: func(sid, addr string, in, out uint64) {
-//	        metrics.Record(sid, addr, in, out)
-//	    },
 //	})
-//	if err := srv.Run(ctx); err != nil {
-//	    log.Fatal(err)
-//	}
+//	if err != nil { log.Fatal(err) }
+//	go srv.Run(ctx)
+//	_ = srv.DisconnectDevice("device-guid")
 //
 // Call [RegisterDefaults] once at program start to register the built-in
 // carriers (jitsi, telemost, wbstream) and transports (datachannel,
@@ -37,6 +26,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/app/session"
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
@@ -45,9 +35,6 @@ import (
 )
 
 // TransportOptions is the marker type for transport-specific tuning options.
-// Pass a value from the corresponding transport package (videochannel.Options,
-// vp8channel.Options, seichannel.Options) or nil for transports without
-// tunables (datachannel).
 type TransportOptions = transport.Options
 
 // AuthFunc is invoked after CLIENT_HELLO to authorize the client and issue a
@@ -60,92 +47,110 @@ type AuthFunc = handshake.AuthFunc
 // starts accepting tunnel streams on that session.
 type SessionOpenFunc = server.SessionOpenFunc
 
-// SessionCloseFunc fires when a session ends. Reasons include "reconnect"
-// (carrier dropped and was reestablished) and "closed" (graceful shutdown or
-// ctx cancel).
+// SessionCloseFunc fires when a session ends.
 type SessionCloseFunc = server.SessionCloseFunc
 
 // TrafficFunc fires once per tunnel stream after both copy loops finish.
-// bytesIn counts client→target bytes; bytesOut counts target→client bytes.
 type TrafficFunc = server.TrafficFunc
+
+// SessionSnapshot describes an active tunnel session.
+type SessionSnapshot struct {
+	SessionID string
+	DeviceID  string
+	OpenedAt  time.Time
+}
 
 // Config holds runtime server configuration.
 type Config struct {
-	// --- carrier selection ---
-	Transport string // datachannel, videochannel, seichannel, vp8channel
-	Carrier   string // jitsi, telemost, wbstream, none
-	RoomURL   string // conference room identifier for the carrier
+	Transport string
+	Carrier   string
+	RoomURL   string
 
-	// --- direct engine mode (Carrier == "none") ---
-	Engine string // livekit, goolom, jitsi
+	Engine string
 	URL    string
 	Token  string
 
-	// --- crypto & networking ---
-	KeyHex         string // 64-char hex (32 bytes) shared with the client
-	DNSServer      string // resolver used for target dials, e.g. "8.8.8.8:53"
-	SOCKSProxyAddr string // optional outbound SOCKS5 proxy host
-	SOCKSProxyPort int    // optional outbound SOCKS5 proxy port
-	SOCKSProxyUser string // optional username for SOCKS5 proxy auth (RFC 1929)
-	SOCKSProxyPass string // optional password for SOCKS5 proxy auth (RFC 1929)
+	KeyHex         string
+	DNSServer      string
+	SOCKSProxyAddr string
+	SOCKSProxyPort int
+	SOCKSProxyUser string
+	SOCKSProxyPass string
 
-	// --- transport tuning ---
-	// TransportOptions carries transport-specific tuning. Use the Options
-	// type from the corresponding internal/transport/* package, or leave nil
-	// for transports that need no extra configuration (datachannel).
 	TransportOptions TransportOptions
 
-	// --- hooks ---
-	// AuthHook authorizes the client. If nil, every client is admitted with a
-	// random UUID as session ID.
-	AuthHook AuthFunc
-	// OnSessionOpen fires after a successful handshake. Nil is a no-op.
-	OnSessionOpen SessionOpenFunc
-	// OnSessionClose fires when the session is torn down. Nil is a no-op.
+	AuthHook       AuthFunc
+	OnSessionOpen  SessionOpenFunc
 	OnSessionClose SessionCloseFunc
-	// OnTraffic fires once per tunnel stream after both copy loops finish.
-	// Nil is a no-op.
-	OnTraffic TrafficFunc
+	OnTraffic      TrafficFunc
 }
 
-// Server is an embeddable tunnel server.
+// Server is an embeddable tunnel server with session disconnect controls.
 type Server struct {
-	cfg Config
+	cfg   Config
+	inner *server.Server
 }
 
 // New returns a Server configured by cfg. Call [Server.Run] to start it.
-func New(cfg Config) *Server {
-	return &Server{cfg: cfg}
+func New(cfg Config) (*Server, error) {
+	inner, err := server.New(server.Config{
+		Transport:        cfg.Transport,
+		Carrier:          cfg.Carrier,
+		RoomURL:          cfg.RoomURL,
+		Engine:           cfg.Engine,
+		URL:              cfg.URL,
+		Token:            cfg.Token,
+		KeyHex:           cfg.KeyHex,
+		DNSServer:        cfg.DNSServer,
+		SOCKSProxyAddr:   cfg.SOCKSProxyAddr,
+		SOCKSProxyPort:   cfg.SOCKSProxyPort,
+		SOCKSProxyUser:   cfg.SOCKSProxyUser,
+		SOCKSProxyPass:   cfg.SOCKSProxyPass,
+		TransportOptions: cfg.TransportOptions,
+		AuthHook:         cfg.AuthHook,
+		OnSessionOpen:    cfg.OnSessionOpen,
+		OnSessionClose:   cfg.OnSessionClose,
+		OnTraffic:        cfg.OnTraffic,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tunnel: %w", err)
+	}
+	return &Server{cfg: cfg, inner: inner}, nil
 }
 
 // Run starts the server and blocks until ctx is cancelled or the carrier ends.
 func (s *Server) Run(ctx context.Context) error {
-	if err := server.Run(ctx, server.Config{
-		Transport:        s.cfg.Transport,
-		Carrier:          s.cfg.Carrier,
-		RoomURL:          s.cfg.RoomURL,
-		Engine:           s.cfg.Engine,
-		URL:              s.cfg.URL,
-		Token:            s.cfg.Token,
-		KeyHex:           s.cfg.KeyHex,
-		DNSServer:        s.cfg.DNSServer,
-		SOCKSProxyAddr:   s.cfg.SOCKSProxyAddr,
-		SOCKSProxyPort:   s.cfg.SOCKSProxyPort,
-		SOCKSProxyUser:   s.cfg.SOCKSProxyUser,
-		SOCKSProxyPass:   s.cfg.SOCKSProxyPass,
-		TransportOptions: s.cfg.TransportOptions,
-		AuthHook:         s.cfg.AuthHook,
-		OnSessionOpen:    s.cfg.OnSessionOpen,
-		OnSessionClose:   s.cfg.OnSessionClose,
-		OnTraffic:        s.cfg.OnTraffic,
-	}); err != nil {
+	if err := s.inner.Run(ctx); err != nil {
 		return fmt.Errorf("tunnel: %w", err)
 	}
 	return nil
 }
 
+// DisconnectSession closes one session by ID.
+func (s *Server) DisconnectSession(sessionID string) error {
+	return s.inner.DisconnectSession(sessionID)
+}
+
+// DisconnectDevice closes all sessions for a device. Returns closed count.
+func (s *Server) DisconnectDevice(deviceID string) int {
+	return s.inner.DisconnectDevice(deviceID)
+}
+
+// ActiveSessions returns currently tracked sessions.
+func (s *Server) ActiveSessions() []SessionSnapshot {
+	raw := s.inner.ActiveSessions()
+	out := make([]SessionSnapshot, len(raw))
+	for i, sn := range raw {
+		out[i] = SessionSnapshot{
+			SessionID: sn.SessionID,
+			DeviceID:  sn.DeviceID,
+			OpenedAt:  sn.OpenedAt,
+		}
+	}
+	return out
+}
+
 // RegisterDefaults registers the built-in carriers, links and transports.
-// Safe to call multiple times.
 func RegisterDefaults() {
 	session.RegisterDefaults()
 }

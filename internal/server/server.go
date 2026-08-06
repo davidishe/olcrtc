@@ -103,6 +103,7 @@ type Server struct {
 	health         *runtime.HealthTracker
 	done           chan struct{}
 	doneOnce       sync.Once
+	startCfg       Config
 }
 
 // peerStat holds the per-session info needed to report the live peer count
@@ -169,12 +170,19 @@ type Config struct {
 
 // Run starts the server with the given configuration.
 func Run(ctx context.Context, cfg Config) error {
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	s, err := New(cfg)
+	if err != nil {
+		return err
+	}
+	return s.Run(ctx)
+}
 
+// New constructs a Server that can be started with [Server.Run] and controlled
+// via DisconnectSession / DisconnectDevice / ActiveSessions while running.
+func New(cfg Config) (*Server, error) {
 	cipher, err := setupCipher(cfg.KeyHex)
 	if err != nil {
-		return fmt.Errorf("setupCipher failed: %w", err)
+		return nil, fmt.Errorf("setupCipher failed: %w", err)
 	}
 
 	hook := cfg.AuthHook
@@ -209,8 +217,18 @@ func Run(ctx context.Context, cfg Config) error {
 		peerSessions:   make(map[string]*peerSession),
 		peerStats:      make(map[string]peerStat),
 		done:           make(chan struct{}),
+		startCfg:       cfg,
 	}
 	s.setupResolver()
+	return s, nil
+}
+
+// Run starts the server and blocks until ctx is cancelled or the carrier ends.
+func (s *Server) Run(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	cfg := s.startCfg
 
 	// Register shutdown BEFORE bringUpLink so a partial setup (e.g.
 	// link.New succeeded but ln.Connect timed out) still tears the
@@ -1335,6 +1353,96 @@ func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
 // Replace it via [Config.AuthHook] to plug in real authorization.
 func defaultAuthHook(_ string, _ map[string]any) (string, error) {
 	return uuid.NewString(), nil
+}
+
+// SessionSnapshot describes an active tunnel session for embedders.
+type SessionSnapshot struct {
+	SessionID string
+	DeviceID  string
+	OpenedAt  time.Time
+}
+
+// ActiveSessions returns a snapshot of currently tracked sessions.
+func (s *Server) ActiveSessions() []SessionSnapshot {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	out := make([]SessionSnapshot, 0, len(s.peerStats))
+	for sid, st := range s.peerStats {
+		out = append(out, SessionSnapshot{
+			SessionID: sid,
+			DeviceID:  st.deviceID,
+			OpenedAt:  st.openedAt,
+		})
+	}
+	return out
+}
+
+// DisconnectSession closes the smux session(s) for the given session ID.
+// Returns ErrSessionNotFound when no matching session is active.
+var ErrSessionNotFound = errors.New("session not found")
+
+func (s *Server) DisconnectSession(sessionID string) error {
+	if sessionID == "" {
+		return ErrSessionNotFound
+	}
+
+	s.sessMu.Lock()
+	if s.sessionID == sessionID {
+		s.sessMu.Unlock()
+		s.closeSession()
+		return nil
+	}
+	var target *peerSession
+	var peerID string
+	for id, ps := range s.peerSessions {
+		if ps != nil && ps.sessionID == sessionID {
+			target = ps
+			peerID = id
+			break
+		}
+	}
+	if target != nil {
+		delete(s.peerSessions, peerID)
+	}
+	s.sessMu.Unlock()
+
+	if target == nil {
+		return ErrSessionNotFound
+	}
+	s.closePeerSession(target, "disconnected")
+	return nil
+}
+
+// DisconnectDevice closes all smux sessions belonging to deviceID.
+// Returns the number of sessions closed.
+func (s *Server) DisconnectDevice(deviceID string) int {
+	if deviceID == "" {
+		return 0
+	}
+	closed := 0
+
+	s.sessMu.Lock()
+	if s.deviceID == deviceID && s.sessionID != "" {
+		s.sessMu.Unlock()
+		s.closeSession()
+		closed++
+		return closed
+	}
+
+	var victims []*peerSession
+	for id, ps := range s.peerSessions {
+		if ps != nil && ps.deviceID == deviceID {
+			victims = append(victims, ps)
+			delete(s.peerSessions, id)
+		}
+	}
+	s.sessMu.Unlock()
+
+	for _, ps := range victims {
+		s.closePeerSession(ps, "disconnected")
+		closed++
+	}
+	return closed
 }
 
 func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID string) {

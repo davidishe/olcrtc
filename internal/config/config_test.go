@@ -37,6 +37,12 @@ socks:
   port: 1080
   user: u
   pass: p
+client:
+  device_id: "11111111-1111-1111-1111-111111111111"
+  access_token: "jwt-token"
+cockney:
+  subscription_url: "https://example.test/api/olcrtc/subscriptions/opaque"
+  refresh_interval: "10m"
 vp8:
   fps: 25
   batch_size: 4
@@ -63,9 +69,48 @@ debug: true
 		t.Fatalf("Load: %v", err)
 	}
 	requireLoadedFile(t, f)
+	if f.Client.DeviceID == "" || f.Client.AccessToken == "" {
+		t.Fatalf("client block not loaded: %+v", f.Client)
+	}
+	if f.Cockney.SubscriptionURL == "" {
+		t.Fatalf("cockney block not loaded: %+v", f.Cockney)
+	}
 
 	got := Apply(session.Config{}, f)
 	requireAppliedConfig(t, got)
+	if got.DeviceID != f.Client.DeviceID || got.AccessToken != f.Client.AccessToken {
+		t.Fatalf("Apply client fields: device=%q token=%q", got.DeviceID, got.AccessToken)
+	}
+}
+
+func TestLoad_WithoutClientBlockStillParses(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.yaml")
+	body := `
+mode: cnc
+auth:
+  provider: jitsi
+room:
+  id: r1
+crypto:
+  key: deadbeef
+net:
+  transport: datachannel
+  dns: 8.8.8.8:53
+socks:
+  host: 127.0.0.1
+  port: 1080
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load legacy: %v", err)
+	}
+	if f.Client.DeviceID != "" {
+		t.Fatalf("unexpected client: %+v", f.Client)
+	}
 }
 
 func requireLoadedFile(t *testing.T, f File) {
@@ -106,6 +151,10 @@ func requireAppliedConfig(t *testing.T, got session.Config) {
 		TrafficMinDelay:       "5ms",
 		TrafficMaxDelay:       "30ms",
 		Amount:                3,
+		DeviceID:              "11111111-1111-1111-1111-111111111111",
+		AccessToken:           "jwt-token",
+		SubscriptionURL:       "https://example.test/api/olcrtc/subscriptions/opaque",
+		SubscriptionRefresh:   "10m",
 	}
 	if got != want {
 		t.Fatalf("Apply produced wrong config: %+v, want %+v", got, want)

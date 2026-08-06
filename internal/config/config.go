@@ -49,8 +49,23 @@ type File struct {
 	Gen       Gen       `yaml:"gen"`
 	Profiles  []Profile `yaml:"profiles"`
 	Failover  Failover  `yaml:"failover"`
+	Client    Client    `yaml:"client"`
+	Cockney   Cockney   `yaml:"cockney"`
 	Data      string    `yaml:"data"`
 	Debug     bool      `yaml:"debug"`
+}
+
+// Client carries handshake identity for Cockney multi-user auth.
+// Optional for backward compatibility — YAML without this block still parses.
+type Client struct {
+	DeviceID    string `yaml:"device_id"`
+	AccessToken string `yaml:"access_token"`
+}
+
+// Cockney enables subscription-URL bootstrap/refresh for Cockney VPN clients.
+type Cockney struct {
+	SubscriptionURL string `yaml:"subscription_url"`
+	RefreshInterval string `yaml:"refresh_interval"` // e.g. "10m"
 }
 
 // Profile is a failover entry that overrides top-level runtime fields.
@@ -291,6 +306,10 @@ func Apply(dst session.Config, f File) session.Config {
 	dst.TrafficMinDelay = pickString(dst.TrafficMinDelay, f.Traffic.MinDelay)
 	dst.TrafficMaxDelay = pickString(dst.TrafficMaxDelay, f.Traffic.MaxDelay)
 	dst.Amount = pickInt(dst.Amount, f.Gen.Amount)
+	dst.DeviceID = pickString(dst.DeviceID, f.Client.DeviceID)
+	dst.AccessToken = pickString(dst.AccessToken, f.Client.AccessToken)
+	dst.SubscriptionURL = pickString(dst.SubscriptionURL, f.Cockney.SubscriptionURL)
+	dst.SubscriptionRefresh = pickString(dst.SubscriptionRefresh, f.Cockney.RefreshInterval)
 	return dst
 }
 
