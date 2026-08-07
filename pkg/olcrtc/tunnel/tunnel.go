@@ -32,6 +32,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
 	"github.com/openlibrecommunity/olcrtc/internal/server"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
+	"github.com/openlibrecommunity/olcrtc/internal/transport/vp8channel"
 )
 
 // TransportOptions is the marker type for transport-specific tuning options.
@@ -153,4 +154,10 @@ func (s *Server) ActiveSessions() []SessionSnapshot {
 // RegisterDefaults registers the built-in carriers, links and transports.
 func RegisterDefaults() {
 	session.RegisterDefaults()
+}
+
+// NewVp8TransportOptions builds TransportOptions for vp8channel (fps/batch).
+// Zero values fall back to library defaults (30 / 64).
+func NewVp8TransportOptions(fps, batchSize int) TransportOptions {
+	return vp8channel.Options{FPS: fps, BatchSize: batchSize}
 }

@@ -85,6 +85,7 @@ type mobileConfig struct {
 	dnsServer        string
 	socksListenHost  string
 	authToken        string
+	accessToken      string
 	vp8FPS           int
 	vp8BatchSize     int
 	livenessInterval time.Duration
@@ -142,6 +143,15 @@ func SetWBToken(token string) {
 	defer mu.Unlock()
 	ensureDefaultConfigLocked()
 	defaults.authToken = strings.TrimSpace(token)
+}
+
+// SetAccessToken sets the Cockney multi-user JWT sent in CLIENT_HELLO claims
+// as access_token. Empty clears the claim so Start behaves like stock clients.
+func SetAccessToken(token string) {
+	mu.Lock()
+	defer mu.Unlock()
+	ensureDefaultConfigLocked()
+	defaults.accessToken = strings.TrimSpace(token)
 }
 
 // SetSocksListenHost selects the local bind host for the SOCKS5 listener.
@@ -264,6 +274,7 @@ func Check(
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: defaultDNSServer,
 				AuthToken: cfg.authToken,
+				Claims:    accessTokenClaims(cfg.accessToken),
 				TransportOptions: vp8channel.Options{
 					FPS:       clampAtLeastOne(vp8FPS, 120),
 					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
@@ -355,6 +366,7 @@ func Ping(
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: defaultDNSServer,
 				AuthToken: cfg.authToken,
+				Claims:    accessTokenClaims(cfg.accessToken),
 				TransportOptions: vp8channel.Options{
 					FPS:       clampAtLeastOne(vp8FPS, 120),
 					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
@@ -603,6 +615,7 @@ func startWithConfig(
 				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
 				DNSServer: cfg.dnsServer,
 				AuthToken: cfg.authToken,
+				Claims:    accessTokenClaims(cfg.accessToken),
 				SOCKSUser: socksUser,
 				SOCKSPass: socksPass,
 				TransportOptions: vp8channel.Options{
@@ -730,6 +743,14 @@ func ensureDefaultConfigLocked() {
 			livenessFailures: control.DefaultFailures,
 		}
 	})
+}
+
+func accessTokenClaims(token string) map[string]any {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil
+	}
+	return map[string]any{"access_token": token}
 }
 
 func normalizeSocksListenHost(host string) string {

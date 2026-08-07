@@ -242,6 +242,65 @@ func TestSetWBTokenReachesClientConfig(t *testing.T) {
 	}
 }
 
+func TestSetAccessTokenReachesClientClaims(t *testing.T) {
+	resetMobileGlobals(t)
+	t.Cleanup(func() {
+		resetMobileGlobals(t)
+	})
+
+	SetAccessToken("  jwt-abc  ")
+
+	seen := make(chan map[string]any, 1)
+	runClientWithReady = func(ctx context.Context, cfg client.Config, onReady func()) error {
+		seen <- cfg.Claims
+		onReady()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	if err := Start(carrierWBStream, testRoomID, "device-guid", "key", 1087, "", ""); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := WaitReady(100); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
+	Stop()
+
+	select {
+	case claims := <-seen:
+		got, _ := claims["access_token"].(string)
+		if got != "jwt-abc" {
+			t.Fatalf("Claims access_token = %q, want %q (claims=%v)", got, "jwt-abc", claims)
+		}
+	default:
+		t.Fatal("Start did not pass Claims to client")
+	}
+
+	SetAccessToken("")
+	seenEmpty := make(chan map[string]any, 1)
+	runClientWithReady = func(ctx context.Context, cfg client.Config, onReady func()) error {
+		seenEmpty <- cfg.Claims
+		onReady()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if err := Start(carrierWBStream, testRoomID, "device-guid", "key", 1088, "", ""); err != nil {
+		t.Fatalf("Start() after clear error = %v", err)
+	}
+	if err := WaitReady(100); err != nil {
+		t.Fatalf("WaitReady() after clear error = %v", err)
+	}
+	Stop()
+	select {
+	case claims := <-seenEmpty:
+		if claims != nil {
+			t.Fatalf("Claims after clear = %v, want nil", claims)
+		}
+	default:
+		t.Fatal("Start after clear did not run")
+	}
+}
+
 //nolint:cyclop // table-driven test naturally has many branches
 func TestStartUsesDefaultsAndCheckWithInjectedRunner(t *testing.T) {
 	resetMobileGlobals(t)
