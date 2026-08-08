@@ -224,6 +224,7 @@ func pickRemoteParticipant(hello *connectionHello, selfUID string) int64 {
 func (s *Session) connectDirect(ctx context.Context, remoteParticipantID int64) error {
 	s.remoteParticipantID = remoteParticipantID
 	s.directMode.Store(true)
+	logger.Infof("vkcalls: ICE servers configured=%d", len(s.iceServers))
 
 	s.pcMu.Lock()
 	pc := s.pc
@@ -394,15 +395,26 @@ func newWebRTCAPI() (*webrtc.API, error) {
 	}
 	settingEngine.LoggerFactory = logger.NewPionLoggerFactory()
 	settingEngine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
-	// Exclude RFC1918/link-local/loopback host candidates. On Cockney NL the
-	// agent also has wg-mgmt (10.254.0.2) with no UDP egress; STUN/TURN bound
-	// there times out and ICE never reaches Connected (media timeout).
+	// mDNS hostnames are useless across the internet and fail on iOS NE
+	// ("no usable interfaces"); disable so gathering focuses on host/srflx/relay.
+	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	// Allow RFC1918/CGNAT interfaces so STUN/TURN can gather from them (mobile
+	// LTE/Wi‑Fi only has private addresses). Still drop loopback/link-local and
+	// Cockney wg-mgmt (10.254.0.0/16), which has no UDP egress on NL agents —
+	// binding STUN there used to stall ICE forever.
 	settingEngine.SetIPFilter(func(ip net.IP) bool {
 		ip4 := ip.To4()
 		if ip4 == nil {
 			return false
 		}
-		return !ip4.IsPrivate() && !ip4.IsLoopback() && !ip4.IsLinkLocalUnicast() && !ip4.IsUnspecified()
+		if ip4.IsLoopback() || ip4.IsLinkLocalUnicast() || ip4.IsUnspecified() {
+			return false
+		}
+		// 10.254.0.0/16 — Cockney wireguard management iface on NL.
+		if ip4[0] == 10 && ip4[1] == 254 {
+			return false
+		}
+		return true
 	})
 
 	mediaEngine := &webrtc.MediaEngine{}

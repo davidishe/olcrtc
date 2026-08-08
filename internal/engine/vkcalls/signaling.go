@@ -570,6 +570,7 @@ func (s *Session) setupPeerConnection() error {
 			return
 		}
 		init := c.ToJSON()
+		logger.Infof("vkcalls: trickle ICE candidate typ=%s", c.Typ.String())
 		cand := map[string]any{"candidate": init.Candidate}
 		if init.SDPMid != nil {
 			cand["sdpMid"] = *init.SDPMid
