@@ -1,0 +1,20 @@
+# Server: turnrelay (public UDP KCP). No VK join on the server side.
+# Run: olcrtc docs/examples/server/server.vkcalls.turnrelay.yaml
+
+mode: srv
+
+auth:
+  provider: none
+
+crypto:
+  key: "REPLACE_ME_WITH_64_HEX_CHARS"
+
+net:
+  transport: turnrelay
+  dns: "8.8.8.8:53"
+
+turnrelay:
+  listen: "0.0.0.0:56000"
+
+data: data
+debug: false

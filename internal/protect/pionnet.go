@@ -37,10 +37,11 @@ var (
 )
 
 // tunInterfacePrefixes lists interface name prefixes excluded from candidate
-// gathering. Keep pptp explicit; it does not match the ppp prefix.
+// gathering. Keep pptp and utun explicit; utun does not match the tun prefix
+// (iOS Packet Tunnel uses utunN), and pptp does not match ppp.
 //
 //nolint:gochecknoglobals // fixed lookup table; a slice cannot be const
-var tunInterfacePrefixes = []string{"tun", "ppp", "pptp"}
+var tunInterfacePrefixes = []string{"utun", "tun", "ppp", "pptp"}
 
 // ProtectedNet implements pion's transport.Net with socket protection and
 // tunnel-interface filtering. Interface data is loaded once at construction

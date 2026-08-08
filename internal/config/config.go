@@ -43,6 +43,7 @@ type File struct {
 	Video     Video     `yaml:"video"`
 	VP8       VP8       `yaml:"vp8"`
 	SEI       SEI       `yaml:"sei"`
+	TurnRelay TurnRelay `yaml:"turnrelay"`
 	Liveness  Liveness  `yaml:"liveness"`
 	Lifecycle Lifecycle `yaml:"lifecycle"`
 	Traffic   Traffic   `yaml:"traffic"`
@@ -160,6 +161,13 @@ type SEI struct {
 	BatchSize    int `yaml:"batch_size"`
 	FragmentSize int `yaml:"fragment_size"`
 	AckTimeoutMS int `yaml:"ack_timeout_ms"`
+}
+
+// TurnRelay tunes the turnrelay transport (KCP over VK TURN / public UDP).
+type TurnRelay struct {
+	Endpoint string `yaml:"endpoint"` // client: agent host:port
+	Listen   string `yaml:"listen"`   // server: bind addr
+	Direct   bool   `yaml:"direct"`   // skip TURN (local tests)
 }
 
 // Liveness tunes the post-handshake control stream ping/pong checks.
@@ -298,6 +306,11 @@ func Apply(dst session.Config, f File) session.Config {
 	dst.SEI.BatchSize = pickInt(dst.SEI.BatchSize, f.SEI.BatchSize)
 	dst.SEI.FragmentSize = pickInt(dst.SEI.FragmentSize, f.SEI.FragmentSize)
 	dst.SEI.AckTimeoutMS = pickInt(dst.SEI.AckTimeoutMS, f.SEI.AckTimeoutMS)
+	dst.TurnEndpoint = pickString(dst.TurnEndpoint, f.TurnRelay.Endpoint)
+	dst.TurnListen = pickString(dst.TurnListen, f.TurnRelay.Listen)
+	if !dst.TurnDirect {
+		dst.TurnDirect = f.TurnRelay.Direct
+	}
 	dst.LivenessInterval = pickString(dst.LivenessInterval, f.Liveness.Interval)
 	dst.LivenessTimeout = pickString(dst.LivenessTimeout, f.Liveness.Timeout)
 	dst.LivenessFailures = pickInt(dst.LivenessFailures, f.Liveness.Failures)

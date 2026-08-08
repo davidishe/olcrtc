@@ -22,6 +22,8 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 
+	"github.com/openlibrecommunity/olcrtc/internal/transport"
+	"github.com/openlibrecommunity/olcrtc/internal/transport/turnrelay"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/vp8channel"
 
 	_ "golang.org/x/mobile/bind"                       // ensure gomobile bind is available
@@ -55,6 +57,7 @@ var (
 const (
 	defaultTransport   = "vp8channel"
 	dataTransport      = "datachannel"
+	turnRelayTransport = "turnrelay"
 	defaultDNSServer   = "8.8.8.8:53"
 	defaultHTTPPingURL = "https://www.google.com/generate_204"
 	defaultSocksHost   = "127.0.0.1"
@@ -86,6 +89,7 @@ type mobileConfig struct {
 	socksListenHost  string
 	authToken        string
 	accessToken      string
+	endpoint         string
 	vp8FPS           int
 	vp8BatchSize     int
 	livenessInterval time.Duration
@@ -161,6 +165,15 @@ func SetSocksListenHost(host string) {
 	defer mu.Unlock()
 	ensureDefaultConfigLocked()
 	defaults.socksListenHost = normalizeSocksListenHost(host)
+}
+
+// SetEndpoint sets the turnrelay peer agent host:port (e.g. "195.133.81.165:56000").
+// Empty clears the endpoint. Must be set before Start when transport is turnrelay.
+func SetEndpoint(endpoint string) {
+	mu.Lock()
+	defer mu.Unlock()
+	ensureDefaultConfigLocked()
+	defaults.endpoint = strings.TrimSpace(endpoint)
 }
 
 // SetVP8Options configures vp8channel.
@@ -275,10 +288,14 @@ func Check(
 				DNSServer: defaultDNSServer,
 				AuthToken: cfg.authToken,
 				Claims:    accessTokenClaims(cfg.accessToken),
-				TransportOptions: vp8channel.Options{
-					FPS:       clampAtLeastOne(vp8FPS, 120),
-					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
-				},
+				Endpoint:  cfg.endpoint,
+				TransportOptions: func() transport.Options {
+					c := cfg
+					c.transport = transportName
+					c.vp8FPS = clampAtLeastOne(vp8FPS, 120)
+					c.vp8BatchSize = clampAtLeastOne(vp8BatchSize, 64)
+					return transportOptionsFor(c)
+				}(),
 				Liveness: livenessConfig(cfg),
 			},
 			func() {
@@ -367,10 +384,14 @@ func Ping(
 				DNSServer: defaultDNSServer,
 				AuthToken: cfg.authToken,
 				Claims:    accessTokenClaims(cfg.accessToken),
-				TransportOptions: vp8channel.Options{
-					FPS:       clampAtLeastOne(vp8FPS, 120),
-					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
-				},
+				Endpoint:  cfg.endpoint,
+				TransportOptions: func() transport.Options {
+					c := cfg
+					c.transport = transportName
+					c.vp8FPS = clampAtLeastOne(vp8FPS, 120)
+					c.vp8BatchSize = clampAtLeastOne(vp8BatchSize, 64)
+					return transportOptionsFor(c)
+				}(),
 				Liveness: livenessConfig(cfg),
 			},
 			func() {
@@ -607,22 +628,20 @@ func startWithConfig(
 		err := runClientWithReady(
 			ctx,
 			client.Config{
-				Transport: cfg.transport,
-				Carrier:   carrierName,
-				RoomURL:   roomURL,
-				KeyHex:    keyHex,
-				DeviceID:  clientID,
-				LocalAddr: socksListenAddr(cfg.socksListenHost, socksPort),
-				DNSServer: cfg.dnsServer,
-				AuthToken: cfg.authToken,
-				Claims:    accessTokenClaims(cfg.accessToken),
-				SOCKSUser: socksUser,
-				SOCKSPass: socksPass,
-				TransportOptions: vp8channel.Options{
-					FPS:       cfg.vp8FPS,
-					BatchSize: cfg.vp8BatchSize,
-				},
-				Liveness: livenessConfig(cfg),
+				Transport:        cfg.transport,
+				Carrier:          carrierName,
+				RoomURL:          roomURL,
+				KeyHex:           keyHex,
+				DeviceID:         clientID,
+				LocalAddr:        socksListenAddr(cfg.socksListenHost, socksPort),
+				DNSServer:        cfg.dnsServer,
+				AuthToken:        cfg.authToken,
+				Claims:           accessTokenClaims(cfg.accessToken),
+				SOCKSUser:        socksUser,
+				SOCKSPass:        socksPass,
+				Endpoint:         cfg.endpoint,
+				TransportOptions: transportOptionsFor(cfg),
+				Liveness:         livenessConfig(cfg),
 			},
 			func() {
 				readyOnce.Do(func() {
@@ -801,10 +820,24 @@ func normalizeTransport(value string) string {
 	switch value {
 	case dataTransport, "data", "dc":
 		return dataTransport
+	case turnRelayTransport, "turn", "turn-relay":
+		return turnRelayTransport
 	case defaultTransport, "vp8":
 		return defaultTransport
 	default:
 		return defaultTransport
+	}
+}
+
+func transportOptionsFor(cfg mobileConfig) transport.Options {
+	switch cfg.transport {
+	case turnRelayTransport:
+		return turnrelay.Options{Endpoint: cfg.endpoint}
+	default:
+		return vp8channel.Options{
+			FPS:       cfg.vp8FPS,
+			BatchSize: cfg.vp8BatchSize,
+		}
 	}
 }
 

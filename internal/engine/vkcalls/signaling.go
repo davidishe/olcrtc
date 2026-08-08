@@ -11,6 +11,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -255,6 +256,7 @@ func (s *Session) readLoop() {
 		if err != nil {
 			if !s.closed.Load() {
 				logger.Infof("vkcalls signaling read ended: %v", err)
+				s.signalEnded("signaling-closed")
 			}
 			return
 		}
@@ -344,6 +346,11 @@ func (s *Session) handleSignalingMessage(msg []byte) {
 		if strings.EqualFold(body.Topology, "SERVER") {
 			s.markTopologySERVER()
 		}
+	case "hungup", "hangup", "conversation-destroyed":
+		logger.Infof("vkcalls: notification %s — resetting media for rejoin", notif.Notification)
+		if s.mediaEverReady.Load() && !s.closed.Load() {
+			go s.handlePeerMediaLost(notif.Notification)
+		}
 	case "transmitted-data":
 		// Prefer nested data; also accept top-level candidate/sdp.
 		if len(notif.Data) > 0 {
@@ -362,9 +369,30 @@ func (s *Session) handleSignalingMessage(msg []byte) {
 				raw, _ := json.Marshal(top)
 				s.handleTransmittedData(raw)
 			}
-			if top.ParticipantID != 0 && s.remoteParticipantID == 0 {
-				s.remoteParticipantID = top.ParticipantID
+			if top.ParticipantID != 0 {
+				s.noteRemoteParticipant(top.ParticipantID, "transmitted-data")
 			}
+		}
+	default:
+		logger.Infof("vkcalls: notification %s", notif.Notification)
+		// Some participant-join events carry ids we can use while waiting alone.
+		var body struct {
+			ParticipantID  int64   `json:"participantId"`
+			ParticipantIDs []int64 `json:"participantIds"`
+			Participant    struct {
+				ID int64 `json:"id"`
+			} `json:"participant"`
+		}
+		_ = json.Unmarshal(msg, &body)
+		id := body.ParticipantID
+		if id == 0 {
+			id = body.Participant.ID
+		}
+		if id == 0 && len(body.ParticipantIDs) > 0 {
+			id = body.ParticipantIDs[0]
+		}
+		if id != 0 {
+			s.noteRemoteParticipant(id, notif.Notification)
 		}
 	}
 }
@@ -422,12 +450,14 @@ func (s *Session) handleRemoteSDPPayload(raw json.RawMessage) {
 		logger.Infof("vkcalls apply remote sdp: %v", err)
 		return
 	}
-	if typ == webrtc.SDPTypeOffer && s.directMode.Load() {
+	if typ == webrtc.SDPTypeOffer {
 		s.pcMu.Lock()
 		local := s.pc.LocalDescription()
 		s.pcMu.Unlock()
-		if local != nil {
-			_ = s.sendSDP(*local)
+		if local != nil && local.Type == webrtc.SDPTypeAnswer {
+			if err := s.sendSDP(*local); err != nil {
+				logger.Infof("vkcalls send answer: %v", err)
+			}
 		}
 	}
 }
@@ -477,6 +507,23 @@ func (s *Session) applyRemoteSDP(sdp string, typ webrtc.SDPType) error {
 	if typ == webrtc.SDPTypeAnswer && s.pc.SignalingState() == webrtc.SignalingStateStable {
 		return nil
 	}
+	// Spurious renegotiation while media is up kills the VP8 track and, without
+	// a fresh OnTrack, starves vp8channel (seen ~15s after first connect).
+	// Allow real ICE restarts (a=ice-restart) through.
+	if typ == webrtc.SDPTypeOffer &&
+		s.pc.ConnectionState() == webrtc.PeerConnectionStateConnected &&
+		s.pc.SignalingState() == webrtc.SignalingStateStable &&
+		!strings.Contains(sdp, "a=ice-restart") {
+		logger.Infof("vkcalls: ignore renegotiation offer while connected (no ice-restart)")
+		return nil
+	}
+	// Offer glare: pion/webrtc here rejects SDP rollback. If we already created
+	// a local offer, ignore the remote offer and keep waiting for an answer —
+	// connectDirect's grace window is meant to avoid this race.
+	if typ == webrtc.SDPTypeOffer && s.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+		logger.Infof("vkcalls: glare ignore remote offer (have-local-offer; no SDP rollback)")
+		return nil
+	}
 	desc := webrtc.SessionDescription{Type: typ, SDP: sdp}
 	if err := s.pc.SetRemoteDescription(desc); err != nil {
 		return fmt.Errorf("set remote description (%s): %w", typ.String(), err)
@@ -489,6 +536,7 @@ func (s *Session) applyRemoteSDP(sdp string, typ webrtc.SDPType) error {
 		if err := s.pc.SetLocalDescription(answer); err != nil {
 			return fmt.Errorf("set local answer: %w", err)
 		}
+		s.answeredRemote.Store(true)
 	}
 	return nil
 }
@@ -544,27 +592,55 @@ func (s *Session) setupPeerConnection() error {
 		logger.Infof("vkcalls pc state: %s", state.String())
 		if state == webrtc.PeerConnectionStateConnected {
 			s.markMediaReady()
+			return
 		}
+		if state != webrtc.PeerConnectionStateFailed && state != webrtc.PeerConnectionStateClosed {
+			return
+		}
+		if s.closed.Load() || s.rearming.Load() || s.awaitingRearm.Load() {
+			return
+		}
+		if !s.mediaEverReady.Load() {
+			return
+		}
+		go s.handlePeerMediaLost(state.String())
 	})
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		logger.Infof("vkcalls: OnTrack kind=%s id=%s mid=%s codec=%s ssrc=%d",
+			track.Kind().String(), track.ID(), track.Msid(), track.Codec().MimeType, track.SSRC())
 		if track.Kind() != webrtc.RTPCodecTypeVideo {
+			// Drain non-video so the receiver does not stall.
+			go func() {
+				buf := make([]byte, 1500)
+				for {
+					if _, _, err := track.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
 			return
+		}
+		// Ask for a keyframe immediately — without it vp8channel may see RTP
+		// but assemble 0 frames, so the 15s handshake times out and the phone
+		// hangs up the VK call.
+		if ssrc := uint32(track.SSRC()); ssrc != 0 {
+			_ = pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc}})
 		}
 		s.videoTrackMu.RLock()
 		cb := s.onVideoTrack
 		s.videoTrackMu.RUnlock()
-		if cb != nil {
-			cb(track, receiver)
+		if cb == nil {
+			logger.Infof("vkcalls: OnTrack video with nil handler — queueing until SetVideoTrackHandler")
+			s.videoTrackMu.Lock()
+			s.pendingRemote = append(s.pendingRemote, pendingRemoteTrack{track: track, receiver: receiver})
+			s.videoTrackMu.Unlock()
+			s.markMediaReady()
+			return
 		}
+		cb(track, receiver)
 		s.markMediaReady()
-		go func() {
-			buf := make([]byte, 1500)
-			for {
-				if _, _, err := receiver.Read(buf); err != nil {
-					return
-				}
-			}
-		}()
+		// Do not receiver.Read() here — vp8channel already owns track.Read();
+		// a second consumer races RTP and yields frames=0 / early EOF.
 	})
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		// DIRECT: wait until local SDP is sent (remoteParticipantID set and

@@ -40,7 +40,7 @@ const MaxMessageSize = 64 * 1024
 
 // DefaultTimeout bounds how long either side will wait for the peer's reply
 // before bailing out.
-const DefaultTimeout = 15 * time.Second
+const DefaultTimeout = 45 * time.Second
 
 // MsgType labels each protocol message.
 type MsgType string

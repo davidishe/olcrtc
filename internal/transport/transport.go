@@ -142,6 +142,13 @@ type Config struct {
 	ProxyAddr  string
 	ProxyPort  int
 
+	// Endpoint is an optional peer host:port used by transports that dial a
+	// fixed remote (turnrelay client → NL agent public UDP).
+	Endpoint string
+	// ListenAddr is an optional bind address for transports that accept
+	// inbound sessions (turnrelay server).
+	ListenAddr string
+
 	// RequireTargetedPeer makes single-peer engines ignore broadcast frames
 	// from unrelated olcrtc clients until a peer sends a frame addressed to
 	// this session's local epoch. Server-side transports leave this disabled

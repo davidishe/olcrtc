@@ -19,10 +19,13 @@ func TestIsTunInterface(t *testing.T) {
 	cases := map[string]bool{
 		"tun0":   true,
 		"tun":    true,
+		"utun0":  true, // iOS Packet Tunnel — must not match only "tun" prefix
+		"utun3":  true,
 		"ppp0":   true,
 		"pptp0":  true,
 		"wlan0":  false,
 		"eth0":   false,
+		"en0":    false,
 		"rmnet0": false,
 		"lo":     false,
 	}

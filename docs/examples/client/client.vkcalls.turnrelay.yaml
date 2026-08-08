@@ -1,0 +1,35 @@
+# Client: KCP over VK TURN allocation → NL agent UDP endpoint.
+# Run: olcrtc docs/examples/client/client.vkcalls.turnrelay.yaml
+#
+# auth.token = OK Calls session_key (or anonymToken) used only to harvest TURN
+# credentials — no WebRTC call / media is started.
+
+mode: cnc
+
+auth:
+  provider: vkcalls
+  token: "REPLACE_WITH_VK_CALLS_SESSION_KEY"
+
+room:
+  id: "https://vk.ru/call/join/REPLACE_JOIN_ID"
+
+crypto:
+  key: "REPLACE_ME_WITH_64_HEX_CHARS" # must match the server / shard
+
+net:
+  transport: turnrelay
+  dns: "8.8.8.8:53"
+
+turnrelay:
+  endpoint: "195.133.81.165:56000"
+
+socks:
+  host: "127.0.0.1"
+  port: 8808
+
+client:
+  device_id: "REPLACE_DEVICE_UUID"
+  access_token: "REPLACE_COCKNEY_JWT"
+
+data: data
+debug: false

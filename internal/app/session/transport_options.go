@@ -3,6 +3,7 @@ package session
 import (
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/seichannel"
+	"github.com/openlibrecommunity/olcrtc/internal/transport/turnrelay"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/videochannel"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/vp8channel"
 )
@@ -36,6 +37,12 @@ func buildTransportOptions(cfg Config) transport.Options {
 			BatchSize:    cfg.SEI.BatchSize,
 			FragmentSize: cfg.SEI.FragmentSize,
 			AckTimeoutMS: cfg.SEI.AckTimeoutMS,
+		}
+	case transportTurnRelay:
+		return turnrelay.Options{
+			Endpoint:   cfg.TurnEndpoint,
+			ListenAddr: cfg.TurnListen,
+			Direct:     cfg.TurnDirect,
 		}
 	default:
 		return nil

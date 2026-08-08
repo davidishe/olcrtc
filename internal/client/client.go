@@ -108,8 +108,10 @@ type Config struct {
 	URL              string
 	Token            string
 	AuthToken        string
-	Liveness         control.Config
-	Traffic          transport.TrafficConfig
+	// Endpoint is the turnrelay peer agent host:port (also via TransportOptions).
+	Endpoint string
+	Liveness control.Config
+	Traffic  transport.TrafficConfig
 
 	// DeviceID overrides the persistent client-side device identifier. Leave
 	// empty to derive one from DeviceIDPath (or generate a random one if both
@@ -209,6 +211,7 @@ func (c *Client) bringUpLink(
 		Name:                names.Generate(),
 		OnData:              c.onData,
 		DNSServer:           cfg.DNSServer,
+		Endpoint:            cfg.Endpoint,
 		RequireTargetedPeer: true,
 		Options:             cfg.TransportOptions,
 		Traffic:             cfg.Traffic,
@@ -832,25 +835,31 @@ func (c *Client) acceptLoop(ctx context.Context, ln net.Listener) {
 			case <-ctx.Done():
 				return
 			default:
-				logger.Warnf("Accept error: %v", err)
+				logger.Warnf("socks: accept error: %v", err)
 				continue
 			}
 		}
+		logger.Infof("socks: accept from %s", conn.RemoteAddr())
 		go c.handleSocks5(ctx, conn)
 	}
 }
 
 func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+	remote := conn.RemoteAddr().String()
 
 	if err := c.socks5Handshake(conn); err != nil {
+		logger.Warnf("socks: handshake failed from %s: %v", remote, err)
 		return
 	}
+	logger.Infof("socks: handshake ok from %s", remote)
 
 	targetAddr, targetPort, err := c.socks5Request(conn)
 	if err != nil {
+		logger.Warnf("socks: request failed from %s: %v", remote, err)
 		return
 	}
+	logger.Infof("socks: request %s:%d from %s", targetAddr, targetPort, remote)
 
 	// Wait until the session handshake is fully complete (sessionID != "").
 	// Without this gate, tunnel streams opened during server-side reinstall
@@ -873,6 +882,8 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		// will be installed shortly by tryReopenSession.
 		select {
 		case <-readyCtx.Done():
+			logger.Warnf("socks: session not ready for %s:%d from %s (waited %s)",
+				targetAddr, targetPort, remote, sessionReadyTimeout)
 			_, _ = conn.Write(replyHostUnreachable())
 			return
 		case <-c.readyChannel():
@@ -884,19 +895,20 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, targetPort int) {
 	stream, err := sess.OpenStream()
 	if err != nil {
-		logger.Warnf("OpenStream failed: %v", err)
+		logger.Warnf("socks: OpenStream failed for %s:%d: %v", targetAddr, targetPort, err)
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
 	defer func() { _ = stream.Close() }()
 
-	logger.Infof("sid=%d tunnel to %s:%d", stream.ID(), targetAddr, targetPort)
+	logger.Infof("socks: tunnel sid=%d → %s:%d", stream.ID(), targetAddr, targetPort)
 
 	if err := c.sendConnectRequest(stream, targetAddr, targetPort); err != nil {
-		logger.Warnf("sid=%d connect failed: %v", stream.ID(), err)
+		logger.Warnf("socks: connect failed sid=%d → %s:%d: %v", stream.ID(), targetAddr, targetPort, err)
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
+	logger.Infof("socks: connected sid=%d → %s:%d", stream.ID(), targetAddr, targetPort)
 
 	if _, err := conn.Write(replySuccess()); err != nil {
 		return

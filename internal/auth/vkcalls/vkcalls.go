@@ -89,6 +89,14 @@ func (Provider) Issue(ctx context.Context, cfg auth.Config) (auth.Credentials, e
 		"clientType":     clientType,
 		"sessionKey":     sessionKey,
 	}
+	// DIRECT role: authorized agent (OK session_key as auth.token) offers;
+	// guest/anonym client always answers. Both get an OK-looking sessionKey
+	// from anonymLogin, so we must not key off the "-w-" prefix alone.
+	if anonymToken == "" && isOKSessionKey(token) {
+		extra["directRole"] = "offer"
+	} else {
+		extra["directRole"] = "answer"
+	}
 	if uid == "" {
 		if u, err := urlUserID(joined.Endpoint); err == nil {
 			extra["uid"] = u

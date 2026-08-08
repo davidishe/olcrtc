@@ -14,6 +14,7 @@ import (
 	"hash/crc32"
 	"hash/fnv"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,7 +32,7 @@ import (
 
 const (
 	defaultMaxPayloadSize = 60 * 1024
-	defaultConnectTimeout = 60 * time.Second
+	defaultConnectTimeout = 3 * time.Minute
 	rtpBufSize            = 65536
 	// outboundQueueSize bounds KCP packets waiting for the paced writer. Sized
 	// to a couple of send windows so KCP's flush never blocks (a blocked
@@ -954,10 +955,19 @@ func (p *streamTransport) restartControlKCPWithHeader(hdr [epochHdrLen]byte) {
 }
 
 func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-	if track.Codec().MimeType != webrtc.MimeTypeVP8 {
+	mime := strings.TrimSpace(track.Codec().MimeType)
+	// Pion can fire OnTrack before codec MIME is populated; our vkcalls SDP
+	// only negotiates VP8, so an empty MIME on a video track is VP8.
+	if mime == "" && track.Kind() == webrtc.RTPCodecTypeVideo {
+		mime = webrtc.MimeTypeVP8
+		logger.Infof("vp8channel: empty codec MIME on video track id=%s — assuming VP8", track.ID())
+	}
+	if !strings.EqualFold(mime, webrtc.MimeTypeVP8) {
+		logger.Infof("vp8channel: drain non-VP8 track id=%s codec=%s", track.ID(), mime)
 		go p.drainTrack(track)
 		return
 	}
+	logger.Infof("vp8channel: reading VP8 track id=%s ssrc=%d codec=%s", track.ID(), track.SSRC(), mime)
 
 	// We don't reset KCP here. Peer restarts are detected by the epoch
 	// header on incoming frames, which works even when the SFU keeps

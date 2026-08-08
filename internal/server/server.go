@@ -151,8 +151,10 @@ type Config struct {
 	URL              string
 	Token            string
 	AuthToken        string
-	Liveness         control.Config
-	Traffic          transport.TrafficConfig
+	// ListenAddr is the turnrelay server UDP bind address (also via TransportOptions).
+	ListenAddr string
+	Liveness   control.Config
+	Traffic    transport.TrafficConfig
 
 	// AuthHook is invoked after CLIENT_HELLO to authorize the client and
 	// return a session ID. If nil, every client is admitted with a random UUID.
@@ -319,6 +321,7 @@ func (s *Server) bringUpLink(
 		DNSServer:  s.dnsServer,
 		ProxyAddr:  s.socksProxyAddr,
 		ProxyPort:  s.socksProxyPort,
+		ListenAddr: cfg.ListenAddr,
 		Options:    cfg.TransportOptions,
 		Traffic:    cfg.Traffic,
 	})

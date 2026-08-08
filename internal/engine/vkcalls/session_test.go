@@ -52,10 +52,51 @@ func TestParseICEFromExtra(t *testing.T) {
 	}
 }
 
-func TestCapabilities(t *testing.T) {
+func TestPeerConnectionDeadNil(t *testing.T) {
 	s := &Session{}
-	caps := s.Capabilities()
-	if caps.ByteStream || !caps.VideoTrack {
-		t.Fatalf("caps=%+v", caps)
+	if !s.peerConnectionDead() {
+		t.Fatal("nil PC should be dead")
+	}
+}
+
+func TestNoteRemoteParticipantIgnoresSelf(t *testing.T) {
+	s := &Session{
+		uid:         "42",
+		acceptPeers: make(chan []int64, 1),
+	}
+	s.noteRemoteParticipant(42, "test")
+	if s.remoteParticipantID != 0 {
+		t.Fatalf("self id recorded: %d", s.remoteParticipantID)
+	}
+}
+
+func TestNoteRemoteParticipantSetsWhileWaiting(t *testing.T) {
+	s := &Session{
+		uid:         "1",
+		acceptPeers: make(chan []int64, 1),
+	}
+	// PC nil → dead, but media never ready → only record id (Connect wait path).
+	s.noteRemoteParticipant(99, "participant-joined")
+	if s.remoteParticipantID != 99 {
+		t.Fatalf("remote=%d", s.remoteParticipantID)
+	}
+	select {
+	case ids := <-s.acceptPeers:
+		if len(ids) != 1 || ids[0] != 99 {
+			t.Fatalf("acceptPeers=%v", ids)
+		}
+	default:
+		t.Fatal("expected acceptPeers push")
+	}
+}
+
+func TestPreferDirectOfferFromExtra(t *testing.T) {
+	offer := &Session{extra: map[string]string{"directRole": "offer"}}
+	if !offer.preferDirectOffer() {
+		t.Fatal("offer role")
+	}
+	answer := &Session{extra: map[string]string{"directRole": "answer"}}
+	if answer.preferDirectOffer() {
+		t.Fatal("answer role")
 	}
 }

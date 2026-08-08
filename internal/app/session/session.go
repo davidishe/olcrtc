@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/datachannel"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/seichannel"
+	"github.com/openlibrecommunity/olcrtc/internal/transport/turnrelay"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/videochannel"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/vp8channel"
 )
@@ -30,9 +32,10 @@ const (
 	modeCNC          = "cnc"
 	modeGen          = "gen"
 	authNone         = "none"
-	transportVideo   = "videochannel"
-	transportVP8     = "vp8channel"
-	transportSEI     = "seichannel"
+	transportVideo     = "videochannel"
+	transportVP8       = "vp8channel"
+	transportSEI       = "seichannel"
+	transportTurnRelay = "turnrelay"
 	videoCodecQRCode = "qrcode"
 	videoCodecTile   = "tile"
 )
@@ -73,7 +76,13 @@ var (
 
 	// ErrTransportRequired indicates that transport is not provided.
 	ErrTransportRequired = errors.New(
-		"transport required (set transport to datachannel, videochannel, seichannel or vp8channel)")
+		"transport required (set transport to datachannel, videochannel, seichannel, vp8channel or turnrelay)")
+	// ErrTurnEndpointRequired indicates that turnrelay client needs an agent endpoint.
+	ErrTurnEndpointRequired = errors.New(
+		"turnrelay endpoint required for cnc mode (set turnrelay.endpoint)")
+	// ErrTurnListenRequired indicates that turnrelay server needs a listen addr.
+	ErrTurnListenRequired = errors.New(
+		"turnrelay listen required for srv mode (set turnrelay.listen)")
 	// ErrKeyRequired indicates that encryption key is not provided.
 	ErrKeyRequired = errors.New("key required (set crypto.key)")
 	// ErrDNSServerRequired indicates that dns server is not provided.
@@ -211,6 +220,13 @@ type Config struct {
 	// SubscriptionURL enables Cockney subscription bootstrap/refresh (client mode).
 	SubscriptionURL      string
 	SubscriptionRefresh  string
+
+	// TurnEndpoint is the NL agent public UDP host:port for turnrelay clients.
+	TurnEndpoint string
+	// TurnListen is the local UDP bind address for turnrelay servers.
+	TurnListen string
+	// TurnDirect skips VK TURN and dials TurnEndpoint over plain UDP (tests).
+	TurnDirect bool
 }
 
 // RegisterDefaults registers built-in carriers and transports.
@@ -220,6 +236,7 @@ func RegisterDefaults() {
 	transport.Register("videochannel", videochannel.New)
 	transport.Register("seichannel", seichannel.New)
 	transport.Register("vp8channel", vp8channel.New)
+	transport.Register(transportTurnRelay, turnrelay.New)
 }
 
 // ApplyAuthDefaults fills in Engine and URL from the auth provider when they are not set explicitly.
@@ -390,7 +407,10 @@ func validateTransportRegistration(cfg Config) error {
 }
 
 func validateCommon(cfg Config) error {
-	if cfg.RoomID == "" && cfg.Auth != authNone {
+	// turnrelay server never joins a carrier room — only the client harvests TURN.
+	if cfg.Transport == transportTurnRelay && cfg.Mode == modeSRV {
+		// fall through without RoomID requirement
+	} else if cfg.RoomID == "" && cfg.Auth != authNone {
 		return ErrRoomIDRequired
 	}
 	if cfg.KeyHex == "" {
@@ -410,9 +430,28 @@ func validateTransportConfig(cfg Config) error {
 		return validateVP8Channel(cfg)
 	case transportSEI:
 		return validateSEIChannel(cfg)
+	case transportTurnRelay:
+		return validateTurnRelay(cfg)
 	default:
 		return nil
 	}
+}
+
+func validateTurnRelay(cfg Config) error {
+	switch cfg.Mode {
+	case modeCNC:
+		if strings.TrimSpace(cfg.TurnEndpoint) == "" && !cfg.TurnDirect {
+			return ErrTurnEndpointRequired
+		}
+		if cfg.TurnDirect && strings.TrimSpace(cfg.TurnEndpoint) == "" {
+			return ErrTurnEndpointRequired
+		}
+	case modeSRV:
+		if strings.TrimSpace(cfg.TurnListen) == "" {
+			// default is applied at transport layer; allow empty here
+		}
+	}
+	return nil
 }
 
 func validateVideoCodec(cfg Config) error {
@@ -666,6 +705,7 @@ func runOnce(
 			SOCKSProxyUser:   cfg.SOCKSProxyUser,
 			SOCKSProxyPass:   cfg.SOCKSProxyPass,
 			TransportOptions: opts,
+			ListenAddr:       cfg.TurnListen,
 			Engine:           cfg.Engine,
 			URL:              cfg.URL,
 			Token:            cfg.Token,
@@ -701,6 +741,7 @@ func runOnce(
 			SOCKSUser:        cfg.SOCKSUser,
 			SOCKSPass:        cfg.SOCKSPass,
 			TransportOptions: opts,
+			Endpoint:         cfg.TurnEndpoint,
 			Engine:           cfg.Engine,
 			URL:              cfg.URL,
 			Token:            cfg.Token,

@@ -32,6 +32,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
 	"github.com/openlibrecommunity/olcrtc/internal/server"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
+	"github.com/openlibrecommunity/olcrtc/internal/transport/turnrelay"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/vp8channel"
 )
 
@@ -42,6 +43,12 @@ type TransportOptions = transport.Options
 // Zero fps/batch fall back to vp8channel package defaults at transport init.
 func NewVp8TransportOptions(fps, batchSize int) TransportOptions {
 	return vp8channel.Options{FPS: fps, BatchSize: batchSize}
+}
+
+// NewTurnRelayOptions builds turnrelay.Options for [Config.TransportOptions].
+// endpoint is the client-side agent host:port; listen is the server bind addr.
+func NewTurnRelayOptions(endpoint, listen string, direct bool) TransportOptions {
+	return turnrelay.Options{Endpoint: endpoint, ListenAddr: listen, Direct: direct}
 }
 
 // AuthFunc is invoked after CLIENT_HELLO to authorize the client and issue a
@@ -90,6 +97,11 @@ type Config struct {
 	SOCKSProxyUser string
 	SOCKSProxyPass string
 
+	// ListenAddr is the turnrelay server UDP bind (e.g. "0.0.0.0:56000").
+	ListenAddr string
+	// Endpoint is the turnrelay client peer agent host:port.
+	Endpoint string
+
 	TransportOptions TransportOptions
 
 	AuthHook       AuthFunc
@@ -110,6 +122,10 @@ func New(cfg Config) (*Server, error) {
 	if authToken == "" {
 		authToken = cfg.Token
 	}
+	opts := cfg.TransportOptions
+	if opts == nil && (cfg.ListenAddr != "" || cfg.Endpoint != "") {
+		opts = NewTurnRelayOptions(cfg.Endpoint, cfg.ListenAddr, false)
+	}
 	inner, err := server.New(server.Config{
 		Transport:        cfg.Transport,
 		Carrier:          cfg.Carrier,
@@ -124,7 +140,8 @@ func New(cfg Config) (*Server, error) {
 		SOCKSProxyPort:   cfg.SOCKSProxyPort,
 		SOCKSProxyUser:   cfg.SOCKSProxyUser,
 		SOCKSProxyPass:   cfg.SOCKSProxyPass,
-		TransportOptions: cfg.TransportOptions,
+		ListenAddr:       cfg.ListenAddr,
+		TransportOptions: opts,
 		AuthHook:         cfg.AuthHook,
 		OnSessionOpen:    cfg.OnSessionOpen,
 		OnSessionClose:   cfg.OnSessionClose,
