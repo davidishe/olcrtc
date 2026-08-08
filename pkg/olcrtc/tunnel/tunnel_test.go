@@ -68,6 +68,37 @@ func TestDisconnectAPISurface(t *testing.T) {
 	}
 }
 
+func TestNew_AuthTokenFallsBackToToken(t *testing.T) {
+	tunnel.RegisterDefaults()
+	const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	srv, err := tunnel.New(tunnel.Config{
+		KeyHex:    key,
+		Transport: "datachannel",
+		Carrier:   "jitsi",
+		RoomURL:   "https://example.test/room",
+		DNSServer: "8.8.8.8:53",
+		Token:     "carrier-from-token",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_ = srv
+
+	srv2, err := tunnel.New(tunnel.Config{
+		KeyHex:    key,
+		Transport: "datachannel",
+		Carrier:   "jitsi",
+		RoomURL:   "https://example.test/room",
+		DNSServer: "8.8.8.8:53",
+		Token:     "engine-only",
+		AuthToken: "explicit-auth",
+	})
+	if err != nil {
+		t.Fatalf("New with AuthToken: %v", err)
+	}
+	_ = srv2
+}
+
 // Compile-time checks: the public type aliases must be assignable.
 var (
 	_ tunnel.AuthFunc         = func(string, map[string]any) (string, error) { return "", nil }

@@ -7,8 +7,8 @@
 //   - Dial WSS endpoint with platform/version/capabilities/tgt=join
 //   - First JSON message carries conversation + participants (connection hello)
 //   - accept-call with mediaSettings (video on for vp8channel)
-//   - SERVER topology: allocate-consumer with local SDP offer; handle
-//     consumer-answered / producer-updated notifications with accept-producer
+//   - SERVER topology: allocate-consumer with capabilities only (no local SDP);
+//     SFU sends producer-updated (remote offer) → accept-producer (local answer)
 //   - ICE candidates via transmit-data {candidate}
 //   - Raw "ping"/"pong" heartbeats on the socket
 package vkcalls
@@ -21,6 +21,7 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +39,7 @@ const (
 	defaultSendQueueSize = 5000
 	wsReadTimeout        = 60 * time.Second
 	wsHandshakeTimeout   = 15 * time.Second
-	connectMediaTimeout  = 25 * time.Second
+	connectMediaTimeout  = 40 * time.Second
 
 	platformWEB       = "WEB"
 	appVersion        = "1.1"
@@ -67,10 +68,11 @@ type Session struct {
 	endpoint       string
 	signalingToken string
 	conversationID string
-	peerID         int64
-	uid            string
-	extra          map[string]string
-	refresh        func(ctx context.Context) (engine.Credentials, error)
+	peerID             int64
+	remoteParticipantID int64
+	uid                string
+	extra              map[string]string
+	refresh            func(ctx context.Context) (engine.Credentials, error)
 
 	ws     *websocket.Conn
 	wsMu   sync.Mutex
@@ -83,11 +85,15 @@ type Session struct {
 	shouldReconnect func() bool
 	onEnded         func(string)
 
-	closeCh       chan struct{}
-	mediaReady    chan struct{}
+	closeCh        chan struct{}
+	mediaReady     chan struct{}
 	mediaReadyOnce sync.Once
-	closed        atomic.Bool
-	sendQueue     chan []byte
+	topologySERVER chan struct{}
+	topologyOnce   sync.Once
+	acceptPeers    chan []int64
+	closed         atomic.Bool
+	sendQueue      chan []byte
+	directMode     atomic.Bool
 
 	videoTrackMu sync.RWMutex
 	videoTracks  []webrtc.TrackLocal
@@ -119,6 +125,8 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 		onData:         cfg.OnData,
 		closeCh:        make(chan struct{}),
 		mediaReady:     make(chan struct{}),
+		topologySERVER: make(chan struct{}),
+		acceptPeers:    make(chan []int64, 1),
 		sendQueue:      make(chan []byte, defaultSendQueueSize),
 		iceServers:     parseICEFromExtra(extra),
 	}
@@ -134,7 +142,7 @@ func (s *Session) Capabilities() engine.Capabilities {
 	return engine.Capabilities{ByteStream: false, VideoTrack: true}
 }
 
-// Connect joins signaling and establishes the SFU PeerConnection.
+// Connect joins signaling and establishes the PeerConnection (SERVER SFU or DIRECT P2P).
 func (s *Session) Connect(ctx context.Context) error {
 	s.closed.Store(false)
 	if err := s.setupPeerConnection(); err != nil {
@@ -148,7 +156,6 @@ func (s *Session) Connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_ = hello
 
 	s.wg.Add(1)
 	go s.readLoop()
@@ -156,15 +163,39 @@ func (s *Session) Connect(ctx context.Context) error {
 	if err := s.sendAcceptCall(); err != nil {
 		return err
 	}
-	if err := s.allocateConsumer(ctx); err != nil {
-		return err
+
+	topology := strings.ToUpper(strings.TrimSpace(hello.Conversation.Topology))
+	logger.Infof("vkcalls: conversation topology=%s participants=%d", topology, len(hello.Conversation.Participants))
+
+	remoteID := pickRemoteParticipant(hello, s.uid)
+	select {
+	case ids := <-s.acceptPeers:
+		if len(ids) > 0 {
+			remoteID = ids[0]
+		}
+	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	if topology == "" || topology == "DIRECT" {
+		if remoteID == 0 {
+			return fmt.Errorf("%w: DIRECT call has no remote participant yet", ErrMediaTimeout)
+		}
+		logger.Infof("vkcalls: DIRECT P2P with participantId=%d", remoteID)
+		if err := s.connectDirect(ctx, remoteID); err != nil {
+			return err
+		}
+	} else {
+		if err := s.allocateConsumer(ctx); err != nil {
+			return err
+		}
 	}
 
 	select {
 	case <-s.mediaReady:
 		return nil
 	case <-time.After(connectMediaTimeout):
-		// SFU may take longer; treat ICE connected as success below.
 		if s.pc != nil && s.pc.ConnectionState() == webrtc.PeerConnectionStateConnected {
 			return nil
 		}
@@ -176,8 +207,74 @@ func (s *Session) Connect(ctx context.Context) error {
 	}
 }
 
+func pickRemoteParticipant(hello *connectionHello, selfUID string) int64 {
+	self := strings.TrimSpace(selfUID)
+	for _, p := range hello.Conversation.Participants {
+		idStr := strconv.FormatInt(p.ID, 10)
+		if self != "" && (idStr == self || p.ExternalID.ID == self) {
+			continue
+		}
+		if p.ID != 0 {
+			return p.ID
+		}
+	}
+	return 0
+}
+
+func (s *Session) connectDirect(ctx context.Context, remoteParticipantID int64) error {
+	s.remoteParticipantID = remoteParticipantID
+	s.directMode.Store(true)
+
+	s.pcMu.Lock()
+	pc := s.pc
+	s.pcMu.Unlock()
+	if pc == nil {
+		return fmt.Errorf("peer connection not ready")
+	}
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		return fmt.Errorf("create offer: %w", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		return fmt.Errorf("set local offer: %w", err)
+	}
+	// Trickle ICE: send offer immediately (full gather balloons SDP and VK
+	// rejects oversized transmit-data payloads).
+	local := pc.LocalDescription()
+	if local == nil {
+		return fmt.Errorf("nil local description after offer")
+	}
+	_ = ctx
+	return s.sendSDP(*local)
+}
+
 func (s *Session) markMediaReady() {
 	s.mediaReadyOnce.Do(func() { close(s.mediaReady) })
+}
+
+func (s *Session) markTopologySERVER() {
+	s.topologyOnce.Do(func() { close(s.topologySERVER) })
+}
+
+func (s *Session) switchTopologySERVER() error {
+	return s.writeJSON(map[string]any{
+		"command":  "switch-topology",
+		"sequence": s.nextSeq(),
+		"topology": "SERVER",
+		"force":    true,
+	})
+}
+
+func (s *Session) waitTopologySERVER(timeout time.Duration) bool {
+	select {
+	case <-s.topologySERVER:
+		return true
+	case <-time.After(timeout):
+		return false
+	case <-s.closeCh:
+		return false
+	}
 }
 
 // Send is unsupported in v1 (no stable byte stream).
@@ -297,11 +394,31 @@ func newWebRTCAPI() (*webrtc.API, error) {
 	}
 	settingEngine.LoggerFactory = logger.NewPionLoggerFactory()
 	settingEngine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
-	settingEngine.SetIPFilter(func(ip net.IP) bool { return ip.To4() != nil })
+	// Exclude RFC1918/link-local/loopback host candidates. On Cockney NL the
+	// agent also has wg-mgmt (10.254.0.2) with no UDP egress; STUN/TURN bound
+	// there times out and ICE never reaches Connected (media timeout).
+	settingEngine.SetIPFilter(func(ip net.IP) bool {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			return false
+		}
+		return !ip4.IsPrivate() && !ip4.IsLoopback() && !ip4.IsLinkLocalUnicast() && !ip4.IsUnspecified()
+	})
 
 	mediaEngine := &webrtc.MediaEngine{}
-	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
-		return nil, fmt.Errorf("register codecs: %w", err)
+	// VK Calls rejects oversized default-codec SDPs over transmit-data
+	// ("invalid-request"). Keep the offer small: VP8 + Opus only.
+	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+		PayloadType:        96,
+	}, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, fmt.Errorf("register vp8: %w", err)
+	}
+	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		PayloadType:        111,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, fmt.Errorf("register opus: %w", err)
 	}
 	interceptorRegistry := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {

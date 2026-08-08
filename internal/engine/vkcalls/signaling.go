@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,37 +142,37 @@ func (s *Session) sendAcceptCall() error {
 }
 
 func (s *Session) allocateConsumer(ctx context.Context) error {
-	s.pcMu.Lock()
-	pc := s.pc
-	s.pcMu.Unlock()
-	if pc == nil {
-		return fmt.Errorf("peer connection not ready")
-	}
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		return fmt.Errorf("create offer: %w", err)
-	}
-	if err := pc.SetLocalDescription(offer); err != nil {
-		return fmt.Errorf("set local description: %w", err)
-	}
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	select {
-	case <-gatherComplete:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(10 * time.Second):
-	}
-	local := pc.LocalDescription()
-	if local == nil {
-		return fmt.Errorf("nil local description")
-	}
+	_ = ctx
+	// SDK ServerTransport._allocateConsumer sends capabilities only — the SFU
+	// answers with producer-updated (remote offer). Sending a local offer here
+	// leaves the PC stuck in have-local-offer and ICE never connects.
 	return s.writeJSON(map[string]any{
 		"command":  "allocate-consumer",
 		"sequence": s.nextSeq(),
 		"capabilities": map[string]any{
-			"sdpSemantics": "unified-plan",
+			"estimatedPerformanceIndex":               10,
+			"audioMix":                                true,
+			"consumerUpdate":                          true,
+			"producerNotificationDataChannelVersion":  8,
+			"producerCommandDataChannelVersion":       3,
+			"consumerScreenDataChannelVersion":        1,
+			"producerScreenDataChannelVersion":        1,
+			"asrDataChannelVersion":                   0,
+			"animojiDataChannelVersion":               1,
+			"animojiBackendRender":                    true,
+			"onDemandTracks":                          true,
+			"unifiedPlan":                             true,
+			"singleSession":                           true,
+			"videoTracksCount":                        1,
+			"red":                                     true,
+			"audioShare":                              false,
+			"fastScreenShare":                         false,
+			"videoSuspend":                            false,
+			"simulcast":                               false,
+			"consumerFastScreenShare":                 false,
+			"consumerFastScreenShareQualityOnDemand":  false,
+			"transparentAudio":                        false,
 		},
-		"description": local.SDP,
 	})
 }
 
@@ -271,45 +272,108 @@ func (s *Session) handleSignalingMessage(msg []byte) {
 		return
 	}
 	if notif.Type != "notification" {
-		// Command responses may carry description for allocate-consumer.
 		var resp struct {
-			Type        string `json:"type"`
-			Description string `json:"description"`
-			SessionID   string `json:"sessionId"`
+			Type            string  `json:"type"`
+			Response        string  `json:"response"`
+			Description     string  `json:"description"`
+			SessionID       string  `json:"sessionId"`
+			ParticipantIDs  []int64 `json:"participantIds"`
+			Error           string  `json:"error"`
 		}
-		if err := json.Unmarshal(msg, &resp); err == nil && resp.Description != "" {
+		if err := json.Unmarshal(msg, &resp); err != nil {
+			return
+		}
+		if resp.Type == "error" && resp.Error != "" {
+			var full struct {
+				Message string `json:"message"`
+				Error   string `json:"error"`
+			}
+			_ = json.Unmarshal(msg, &full)
+			logger.Infof("vkcalls signaling error: %s (%s)", full.Error, full.Message)
+			return
+		}
+		if resp.Response == "accept-call" {
+			select {
+			case s.acceptPeers <- resp.ParticipantIDs:
+			default:
+			}
+			return
+		}
+		if resp.Description != "" {
 			_ = s.applyRemoteSDP(resp.Description, webrtc.SDPTypeAnswer)
 		}
 		return
 	}
 	switch notif.Notification {
 	case "consumer-answered":
+		// SDK puts description on the notification object itself (not data{}).
 		var data consumerAnsweredData
-		if err := json.Unmarshal(notif.Data, &data); err != nil {
+		if err := json.Unmarshal(msg, &data); err != nil || data.Description == "" {
+			_ = json.Unmarshal(notif.Data, &data)
+		}
+		if data.Description == "" {
+			logger.Infof("vkcalls: consumer-answered without description")
 			return
 		}
-		_ = s.applyRemoteSDP(data.Description, webrtc.SDPTypeAnswer)
+		if err := s.applyRemoteSDP(data.Description, webrtc.SDPTypeAnswer); err != nil {
+			logger.Infof("vkcalls apply consumer answer: %v", err)
+		}
 	case "producer-updated":
 		var data producerUpdatedData
-		if err := json.Unmarshal(notif.Data, &data); err != nil {
+		if err := json.Unmarshal(msg, &data); err != nil || data.Description == "" {
+			_ = json.Unmarshal(notif.Data, &data)
+		}
+		if data.Description == "" {
+			logger.Infof("vkcalls: producer-updated without description")
 			return
 		}
+		logger.Infof("vkcalls: producer-updated sessionId=%s sdp_len=%d", data.SessionID, len(data.Description))
 		if err := s.applyRemoteSDP(data.Description, webrtc.SDPTypeOffer); err != nil {
 			logger.Infof("vkcalls apply producer offer: %v", err)
 			return
 		}
-		_ = s.sendAcceptProducer(data.SessionID)
+		if err := s.sendAcceptProducer(data.SessionID); err != nil {
+			logger.Infof("vkcalls accept-producer: %v", err)
+		}
+	case "topology-changed":
+		var body struct {
+			Topology string `json:"topology"`
+		}
+		_ = json.Unmarshal(msg, &body)
+		logger.Infof("vkcalls: topology-changed %s", body.Topology)
+		if strings.EqualFold(body.Topology, "SERVER") {
+			s.markTopologySERVER()
+		}
 	case "transmitted-data":
-		s.handleTransmittedData(notif.Data)
+		// Prefer nested data; also accept top-level candidate/sdp.
+		if len(notif.Data) > 0 {
+			s.handleTransmittedData(notif.Data)
+		}
+		var top struct {
+			Candidate *webrtc.ICECandidateInit `json:"candidate"`
+			SDP       json.RawMessage          `json:"sdp"`
+			Data      json.RawMessage          `json:"data"`
+			ParticipantID int64                `json:"participantId"`
+		}
+		if err := json.Unmarshal(msg, &top); err == nil {
+			if len(top.Data) > 0 {
+				s.handleTransmittedData(top.Data)
+			} else {
+				raw, _ := json.Marshal(top)
+				s.handleTransmittedData(raw)
+			}
+			if top.ParticipantID != 0 && s.remoteParticipantID == 0 {
+				s.remoteParticipantID = top.ParticipantID
+			}
+		}
 	}
 }
 
 func (s *Session) handleTransmittedData(raw json.RawMessage) {
 	var envelope struct {
 		Candidate *webrtc.ICECandidateInit `json:"candidate"`
-		SDP       string                   `json:"sdp"`
+		SDP       json.RawMessage          `json:"sdp"`
 	}
-	// Data may be nested or a raw object.
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		var wrapped struct {
 			Data json.RawMessage `json:"data"`
@@ -317,6 +381,9 @@ func (s *Session) handleTransmittedData(raw json.RawMessage) {
 		if err2 := json.Unmarshal(raw, &wrapped); err2 == nil {
 			_ = json.Unmarshal(wrapped.Data, &envelope)
 		}
+	}
+	if len(envelope.SDP) > 0 {
+		s.handleRemoteSDPPayload(envelope.SDP)
 	}
 	if envelope.Candidate != nil {
 		s.pcMu.Lock()
@@ -328,6 +395,75 @@ func (s *Session) handleTransmittedData(raw json.RawMessage) {
 	}
 }
 
+func (s *Session) handleRemoteSDPPayload(raw json.RawMessage) {
+	// SDK sends RTCSessionDescriptionInit as object {type,sdp} or sometimes a bare string.
+	var obj struct {
+		Type string `json:"type"`
+		SDP  string `json:"sdp"`
+	}
+	sdp := ""
+	typ := webrtc.SDPTypeAnswer
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.SDP != "" {
+		sdp = obj.SDP
+		switch strings.ToLower(obj.Type) {
+		case "offer":
+			typ = webrtc.SDPTypeOffer
+		case "answer", "pranswer":
+			typ = webrtc.SDPTypeAnswer
+		}
+	} else {
+		_ = json.Unmarshal(raw, &sdp)
+	}
+	if strings.TrimSpace(sdp) == "" {
+		return
+	}
+	logger.Infof("vkcalls: remote SDP type=%s len=%d", typ.String(), len(sdp))
+	if err := s.applyRemoteSDP(sdp, typ); err != nil {
+		logger.Infof("vkcalls apply remote sdp: %v", err)
+		return
+	}
+	if typ == webrtc.SDPTypeOffer && s.directMode.Load() {
+		s.pcMu.Lock()
+		local := s.pc.LocalDescription()
+		s.pcMu.Unlock()
+		if local != nil {
+			_ = s.sendSDP(*local)
+		}
+	}
+}
+
+func (s *Session) sendSDP(desc webrtc.SessionDescription) error {
+	if s.remoteParticipantID == 0 {
+		return fmt.Errorf("no remote participant for sendSdp")
+	}
+	return s.writeJSON(map[string]any{
+		"command":         "transmit-data",
+		"sequence":        s.nextSeq(),
+		"participantId":   s.remoteParticipantID,
+		"participantType": "USER",
+		"data": map[string]any{
+			"sdp": map[string]string{
+				"type": desc.Type.String(),
+				"sdp":  desc.SDP,
+			},
+		},
+	})
+}
+
+// composeParticipantID is kept for tests/docs; wire protocol uses numeric
+// participantId + participantType (SDK decomposes "u"+id before send).
+func composeParticipantID(id int64, idType string, deviceIdx int) string {
+	prefix := "u"
+	if strings.EqualFold(idType, "GROUP") {
+		prefix = "g"
+	}
+	out := prefix + strconv.FormatInt(id, 10)
+	if deviceIdx != 0 {
+		out += ":d" + strconv.Itoa(deviceIdx)
+	}
+	return out
+}
+
 func (s *Session) applyRemoteSDP(sdp string, typ webrtc.SDPType) error {
 	if strings.TrimSpace(sdp) == "" {
 		return nil
@@ -336,6 +472,10 @@ func (s *Session) applyRemoteSDP(sdp string, typ webrtc.SDPType) error {
 	defer s.pcMu.Unlock()
 	if s.pc == nil {
 		return ErrSessionClosed
+	}
+	// Ignore duplicate answers once signaling is already stable.
+	if typ == webrtc.SDPTypeAnswer && s.pc.SignalingState() == webrtc.SignalingStateStable {
+		return nil
 	}
 	desc := webrtc.SessionDescription{Type: typ, SDP: sdp}
 	if err := s.pc.SetRemoteDescription(desc); err != nil {
@@ -354,6 +494,19 @@ func (s *Session) applyRemoteSDP(sdp string, typ webrtc.SDPType) error {
 }
 
 func (s *Session) sendAcceptProducer(sessionID string) error {
+	s.pcMu.Lock()
+	pc := s.pc
+	s.pcMu.Unlock()
+	if pc == nil {
+		return fmt.Errorf("no peer connection for accept-producer")
+	}
+	// Prefer complete local SDP (host + srflx) so SFU can connect without
+	// relying on trickle ICE, which SERVER topology may ignore.
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	select {
+	case <-gatherComplete:
+	case <-time.After(8 * time.Second):
+	}
 	s.pcMu.Lock()
 	local := s.pc.LocalDescription()
 	s.pcMu.Unlock()
@@ -411,16 +564,25 @@ func (s *Session) setupPeerConnection() error {
 		}()
 	})
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil || s.peerID == 0 {
+		// DIRECT: wait until local SDP is sent (remoteParticipantID set and
+		// trickle after offer). Candidates before the offer are rejected.
+		if c == nil || s.remoteParticipantID == 0 || !s.directMode.Load() {
 			return
 		}
 		init := c.ToJSON()
+		cand := map[string]any{"candidate": init.Candidate}
+		if init.SDPMid != nil {
+			cand["sdpMid"] = *init.SDPMid
+		}
+		if init.SDPMLineIndex != nil {
+			cand["sdpMLineIndex"] = *init.SDPMLineIndex
+		}
 		_ = s.writeJSON(map[string]any{
 			"command":         "transmit-data",
 			"sequence":        s.nextSeq(),
-			"participantId":   s.peerID,
+			"participantId":   s.remoteParticipantID,
 			"participantType": "USER",
-			"data":            map[string]any{"candidate": init},
+			"data":            map[string]any{"candidate": cand},
 		})
 	})
 
@@ -432,6 +594,14 @@ func (s *Session) setupPeerConnection() error {
 			_ = pc.Close()
 			return fmt.Errorf("add pending track: %w", err)
 		}
+	}
+	// VK DIRECT offers include audio+video (SDK offerToReceiveAudio/Video).
+	// A video-only SDP is rejected as invalid-request on transmit-data.
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendrecv,
+	}); err != nil {
+		_ = pc.Close()
+		return fmt.Errorf("add audio transceiver: %w", err)
 	}
 
 	s.pcMu.Lock()

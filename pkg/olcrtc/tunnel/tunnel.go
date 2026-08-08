@@ -75,7 +75,13 @@ type Config struct {
 
 	Engine string
 	URL    string
-	Token  string
+	// Token is the engine/signaling token for direct carriers (auth.provider=none).
+	Token string
+	// AuthToken is a pre-issued carrier account token (wbstream moderator JWT,
+	// vkcalls OK session_key / anonymToken, etc.). Forwarded to auth.Provider.
+	// When empty, Token is used as a fallback so embedders that only set Token
+	// (historically Cockney agent CarrierToken) still reach auth providers.
+	AuthToken string
 
 	KeyHex         string
 	DNSServer      string
@@ -100,6 +106,10 @@ type Server struct {
 
 // New returns a Server configured by cfg. Call [Server.Run] to start it.
 func New(cfg Config) (*Server, error) {
+	authToken := cfg.AuthToken
+	if authToken == "" {
+		authToken = cfg.Token
+	}
 	inner, err := server.New(server.Config{
 		Transport:        cfg.Transport,
 		Carrier:          cfg.Carrier,
@@ -107,6 +117,7 @@ func New(cfg Config) (*Server, error) {
 		Engine:           cfg.Engine,
 		URL:              cfg.URL,
 		Token:            cfg.Token,
+		AuthToken:        authToken,
 		KeyHex:           cfg.KeyHex,
 		DNSServer:        cfg.DNSServer,
 		SOCKSProxyAddr:   cfg.SOCKSProxyAddr,
