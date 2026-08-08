@@ -500,26 +500,29 @@ func (s *Session) sendAcceptProducer(sessionID string) error {
 	if pc == nil {
 		return fmt.Errorf("no peer connection for accept-producer")
 	}
-	// Prefer complete local SDP (host + srflx) so SFU can connect without
-	// relying on trickle ICE, which SERVER topology may ignore.
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	select {
-	case <-gatherComplete:
-	case <-time.After(8 * time.Second):
-	}
+	// Match VK Calls SDK: send the local answer as soon as SetLocalDescription
+	// returns. Waiting for GatheringCompletePromise (~8s) previously produced
+	// stale/partial answers that the SFU rejected as invalid-request while ICE
+	// was still gathering — and SERVER topology does not use our trickle path.
 	s.pcMu.Lock()
 	local := s.pc.LocalDescription()
 	s.pcMu.Unlock()
-	if local == nil {
+	if local == nil || strings.TrimSpace(local.SDP) == "" {
 		return fmt.Errorf("no local description for accept-producer")
 	}
+	logger.Infof("vkcalls: accept-producer sessionId=%s sdp_len=%d", sessionID, len(local.SDP))
 	payload := map[string]any{
 		"command":     "accept-producer",
 		"sequence":    s.nextSeq(),
 		"description": local.SDP,
 	}
 	if sessionID != "" {
-		payload["sessionId"] = sessionID
+		// SDK passes sessionId as a JSON number (unix-ms style id).
+		if sid, err := strconv.ParseInt(sessionID, 10, 64); err == nil {
+			payload["sessionId"] = sid
+		} else {
+			payload["sessionId"] = sessionID
+		}
 	}
 	return s.writeJSON(payload)
 }
