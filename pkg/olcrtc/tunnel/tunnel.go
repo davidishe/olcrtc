@@ -161,9 +161,3 @@ func (s *Server) ActiveSessions() []SessionSnapshot {
 func RegisterDefaults() {
 	session.RegisterDefaults()
 }
-
-// NewVp8TransportOptions builds TransportOptions for vp8channel (fps/batch).
-// Zero values fall back to library defaults (30 / 64).
-func NewVp8TransportOptions(fps, batchSize int) TransportOptions {
-	return vp8channel.Options{FPS: fps, BatchSize: batchSize}
-}
