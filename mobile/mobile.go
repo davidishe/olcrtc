@@ -199,7 +199,7 @@ func SetDebug(enabled bool) {
 }
 
 // Start launches the olcRTC client in background.
-// carrierName: carrier name ("telemost", "wbstream", "jitsi")
+// carrierName: carrier name ("telemost", "wbstream", "jitsi", "vkcalls")
 // roomID: carrier-specific room ID
 // clientID: client identifier that must match the server's -client-id
 // keyHex: 64-char hex encryption key

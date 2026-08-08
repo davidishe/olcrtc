@@ -16,12 +16,12 @@
 
 ## Compatibility matrix
 
-| Transport | telemost | wbstream | jitsi |
-|-----------|:--------:|:--------:|:-----:|
-| datachannel | - | ~ | + |
-| vp8channel | + | + | ~ |
-| seichannel | - | + | ~ |
-| videochannel | + | + | ~ |
+| Transport | telemost | wbstream | jitsi | vkcalls |
+|-----------|:--------:|:--------:|:-----:|:-------:|
+| datachannel | - | ~ | + | - |
+| vp8channel | + | + | ~ | ~ |
+| seichannel | - | + | ~ | - |
+| videochannel | + | + | ~ | - |
 
 **Legend:**
 - `+` - works (passes E2E tests)
@@ -31,6 +31,8 @@
 **Telemost:** only vp8channel passes stably. DataChannel was removed from Telemost. seichannel is not supported. videochannel is slow.
 
 **WBStream:** all transports except datachannel work. DataChannel does not work in the normal guest flow without being granted moderator - WB Stream issues tokens with `canPublishData=false`, and DC does not route data. To use `datachannel` over `wbstream`, set `auth.token` to an account/moderator token (`canPublishData=true`); see `auth.token` in the optional fields below.
+
+**VK Calls (`vkcalls`):** v1 targets `vp8channel` only (guest join via `calls.okcdn.ru` + WSS SFU). Rooms are created in the VK UI (`https://vk.com/call/join/<id>`). Guest anonym token acquisition may hit captcha; set `auth.token` to a pre-issued `anonymToken` when that happens. DataChannel is not promised in v1.
 
 **Jitsi:** datachannel passes stably - it is implemented on top of the colibri-ws bridge channel and sends bytes via an `EndpointMessage{raw}` broadcast. It fits self-hosted and public Jitsi Meet instances without authentication (`https://meet.jit.si/...` etc.; instances in docs/examples/jitsi.instances.yaml). Check in a browser which of the servers is reachable in your network. Video transports (vp8channel, seichannel, videochannel) expose a sendable VideoTrack through the pion PeerConnection after the Jingle session-accept, but Jicofo requires additional protocol steps (LastN, ReceiverVideoConstraints, source-add) to route video - that is why they are marked `~`.
 
@@ -47,7 +49,7 @@ Speed in descending order: `datachannel` > `vp8channel` > `seichannel` > `videoc
 | YAML field | What to enter |
 |-----------|-------------|
 | `mode` | `srv` on the server, `cnc` on the client, `gen` to generate a Room ID |
-| `auth.provider` | `telemost`, `wbstream`, `jitsi` or `none` |
+| `auth.provider` | `telemost`, `wbstream`, `jitsi`, `vkcalls` or `none` |
 | `net.transport` | `datachannel`, `vp8channel`, `seichannel` or `videochannel` |
 | `room.id` | Room ID |
 | `crypto.key` or `crypto.key_file` | Encryption key, hex 64 chars. Generate: `openssl rand -hex 32` |
@@ -61,7 +63,7 @@ Speed in descending order: `datachannel` > `vp8channel` > `seichannel` > `videoc
 | YAML field | Description |
 |-----------|----------|
 | `debug` | `true` for verbose connection logs |
-| `auth.token` | Pre-issued account token for `wbstream`. When set, the session joins as that account instead of an anonymous guest; empty uses the guest flow. In the guest flow the obtained token is logged once so it can be copied back into this field to keep the same identity. Practical effect for `datachannel`: a guest token carries `canPublishData=false`, so the SCTP data channel opens but routes no bytes (the tunnel is up and silent); an account token with moderator rights carries `canPublishData=true` and routes data normally. So `datachannel` over `wbstream` requires an `auth.token` with publish rights; on the guest flow use `vp8channel`, `seichannel` or `videochannel` instead. To grant moderator: open the participants list, then the three dots next to the client/server entry, then the `Moderator` button (needed on both sides) |
+| `auth.token` | Pre-issued account token for `wbstream` or pre-issued VK `anonymToken` for `vkcalls`. When set, the session joins as that identity instead of the anonymous guest path; empty uses the guest flow. In the guest flow the obtained token is logged once so it can be copied back into this field to keep the same identity. Practical effect for `wbstream`+`datachannel`: a guest token carries `canPublishData=false`, so the SCTP data channel opens but routes no bytes (the tunnel is up and silent); an account token with moderator rights carries `canPublishData=true` and routes data normally. So `datachannel` over `wbstream` requires an `auth.token` with publish rights; on the guest flow use `vp8channel`, `seichannel` or `videochannel` instead. For `vkcalls`, `auth.token` bypasses captcha-gated guest anonym token acquisition. To grant WB moderator: open the participants list, then the three dots next to the client/server entry, then the `Moderator` button (needed on both sides) |
 | `profiles` | List of failover profiles for `srv`/`cnc` |
 | `failover.retry_delay` | Pause before the next profile, e.g. `2s` |
 | `failover.max_cycles` | How many full passes over the profiles to make; `0` = unlimited |

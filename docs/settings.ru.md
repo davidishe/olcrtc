@@ -16,12 +16,12 @@
 
 ## Матрица совместимости
 
-| Transport | telemost | wbstream | jitsi |
-|-----------|:--------:|:--------:|:-----:|
-| datachannel | - | ~ | + |
-| vp8channel | + | + | ~ |
-| seichannel | - | + | ~ |
-| videochannel | + | + | ~ |
+| Transport | telemost | wbstream | jitsi | vkcalls |
+|-----------|:--------:|:--------:|:-----:|:-------:|
+| datachannel | - | ~ | + | - |
+| vp8channel | + | + | ~ | ~ |
+| seichannel | - | + | ~ | - |
+| videochannel | + | + | ~ | - |
 
 **Легенда:**
 - `+` - работает (pass в E2E тестах)
@@ -47,7 +47,7 @@
 | YAML поле | Что вводить |
 |-----------|-------------|
 | `mode` | `srv` на сервере, `cnc` на клиенте, `gen` для генерации Room ID |
-| `auth.provider` | `telemost`, `wbstream`, `jitsi` или `none` |
+| `auth.provider` | `telemost`, `wbstream`, `jitsi`, `vkcalls` или `none` |
 | `net.transport` | `datachannel`, `vp8channel`, `seichannel` или `videochannel` |
 | `room.id` | Room ID |
 | `crypto.key` или `crypto.key_file` | Ключ шифрования hex 64 символа. Генерация: `openssl rand -hex 32` |

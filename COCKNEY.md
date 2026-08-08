@@ -8,6 +8,7 @@ Upstream: https://github.com/openlibrecommunity/olcrtc
 - YAML `cockney.subscription_url` / `refresh_interval` (subscription bootstrap helpers)
 - Embeddable `tunnel.Server`: `DisconnectSession`, `DisconnectDevice`, `ActiveSessions`
 - Backward compatible: YAML without `client` / `cockney` still parses
+- Carrier `vkcalls` (VK Звонки) + `vp8channel` via `internal/auth/vkcalls` + `internal/engine/vkcalls`
 
 ## Pin
 

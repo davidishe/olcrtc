@@ -14,11 +14,13 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/auth"
 	authJitsi "github.com/openlibrecommunity/olcrtc/internal/auth/jitsi"
 	authTelemost "github.com/openlibrecommunity/olcrtc/internal/auth/telemost"
+	authVkCalls "github.com/openlibrecommunity/olcrtc/internal/auth/vkcalls"
 	authWBStream "github.com/openlibrecommunity/olcrtc/internal/auth/wbstream"
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 	_ "github.com/openlibrecommunity/olcrtc/internal/engine/goolom"  // register goolom engine via init
 	_ "github.com/openlibrecommunity/olcrtc/internal/engine/jitsi"   // register jitsi engine via init
 	_ "github.com/openlibrecommunity/olcrtc/internal/engine/livekit" // register livekit engine via init
+	_ "github.com/openlibrecommunity/olcrtc/internal/engine/vkcalls" // register vkcalls engine via init
 )
 
 // ErrCarrierNotFound is returned when an unregistered carrier name is requested.
@@ -78,12 +80,13 @@ func Available() []string {
 	return names
 }
 
-// RegisterDefaults wires the built-in carriers: jitsi, telemost, wbstream
-// and "none" (direct engine access).
+// RegisterDefaults wires the built-in carriers: jitsi, telemost, wbstream,
+// vkcalls and "none" (direct engine access).
 func RegisterDefaults() {
 	registerEngineAuth("wbstream", authWBStream.Provider{})
 	registerEngineAuth("telemost", authTelemost.Provider{})
 	registerEngineAuth("jitsi", authJitsi.Provider{})
+	registerEngineAuth("vkcalls", authVkCalls.Provider{})
 	registerDirect("none")
 }
 

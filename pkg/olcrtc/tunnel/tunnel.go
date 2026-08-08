@@ -19,7 +19,7 @@
 //	_ = srv.DisconnectDevice("device-guid")
 //
 // Call [RegisterDefaults] once at program start to register the built-in
-// carriers (jitsi, telemost, wbstream) and transports (datachannel,
+// carriers (jitsi, telemost, wbstream, vkcalls) and transports (datachannel,
 // videochannel, seichannel, vp8channel).
 package tunnel
 
@@ -37,6 +37,12 @@ import (
 
 // TransportOptions is the marker type for transport-specific tuning options.
 type TransportOptions = transport.Options
+
+// NewVp8TransportOptions builds vp8channel.Options for [Config.TransportOptions].
+// Zero fps/batch fall back to vp8channel package defaults at transport init.
+func NewVp8TransportOptions(fps, batchSize int) TransportOptions {
+	return vp8channel.Options{FPS: fps, BatchSize: batchSize}
+}
 
 // AuthFunc is invoked after CLIENT_HELLO to authorize the client and issue a
 // session ID. Returning a non-nil error rejects the handshake; the error's

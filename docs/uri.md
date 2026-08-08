@@ -37,7 +37,7 @@ The `<key=value&...>` block is the transport parameter payload in angle brackets
 
 | Field | Meaning |
 |------|----------|
-| `<Auth>` | Auth provider name, e.g. `telemost`, `wbstream`, `jitsi` |
+| `<Auth>` | Auth provider name, e.g. `telemost`, `wbstream`, `jitsi`, `vkcalls` |
 | `<Transport>` | Transport name, e.g. `datachannel`, `vp8channel`, `seichannel`, `videochannel` |
 | payload | Transport parameters in `<key=value&...>`. Keys match the YAML fields. The block is dropped when defaults are used |
 | `<RoomID>` | Room identifier or auth-specific room URL/ID |
@@ -145,6 +145,14 @@ data: data
 ```text
 olcrtc://wbstream?vp8channel<vp8-fps=60&vp8-batch=64>@room-01#d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799$RU / olc free sub / IPv6
 ```
+
+### vkcalls + vp8channel
+
+```text
+olcrtc://vkcalls?vp8channel@join-abc#d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799$Cockney
+```
+
+Room id is the VK join link id (`https://vk.com/call/join/<id>` → `<id>`).
 
 ### YAML equivalent
 
