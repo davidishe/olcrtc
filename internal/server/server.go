@@ -27,7 +27,12 @@ import (
 	"github.com/xtaci/smux"
 )
 
-const connectCommand = "connect"
+const (
+	connectCommand = "connect"
+	// udpCommand asks for a datagram relay instead of a TCP connection; the
+	// destination travels with each datagram rather than in the request.
+	udpCommand = "udp"
+)
 
 var (
 	// ErrKeyRequired re-exports runtime.ErrKeyRequired for compatibility with
@@ -1328,6 +1333,10 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 			header = append(header, tmp[:n]...)
 			if req, ok := parseConnectRequest(header); ok {
 				_ = stream.SetReadDeadline(time.Time{})
+				if req.Cmd == udpCommand {
+					s.relayUDP(stream, sessionID)
+					return
+				}
 				s.dispatch(stream, req, sessionID)
 				return
 			}
@@ -1346,7 +1355,7 @@ func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
 	if err := json.Unmarshal(buf, &req); err != nil {
 		return req, false
 	}
-	if req.Cmd != connectCommand {
+	if req.Cmd != connectCommand && req.Cmd != udpCommand {
 		return req, false
 	}
 	return req, true

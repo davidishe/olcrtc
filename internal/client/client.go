@@ -24,9 +24,13 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
+	"github.com/openlibrecommunity/olcrtc/internal/socks5udp"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/xtaci/smux"
 )
+
+// socksCmdConnect is the RFC 1928 CONNECT command.
+const socksCmdConnect = 0x01
 
 var (
 	// ErrConnectFailed is returned when a tunnel connection fails.
@@ -854,12 +858,17 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	}
 	logger.Infof("socks: handshake ok from %s", remote)
 
-	targetAddr, targetPort, err := c.socks5Request(conn)
+	cmd, targetAddr, targetPort, err := c.socks5Request(conn)
 	if err != nil {
 		logger.Warnf("socks: request failed from %s: %v", remote, err)
 		return
 	}
-	logger.Infof("socks: request %s:%d from %s", targetAddr, targetPort, remote)
+	udpRelay := cmd == socks5udp.CmdUDPInTCP
+	if udpRelay {
+		logger.Infof("socks: udp relay request from %s", remote)
+	} else {
+		logger.Infof("socks: request %s:%d from %s", targetAddr, targetPort, remote)
+	}
 
 	// Wait until the session handshake is fully complete (sessionID != "").
 	// Without this gate, tunnel streams opened during server-side reinstall
@@ -873,7 +882,11 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		sid := c.sessionID
 		c.sessMu.RUnlock()
 		if sess != nil && !sess.IsClosed() && sid != "" {
-			c.tunnel(conn, sess, targetAddr, targetPort)
+			if udpRelay {
+				c.tunnelUDP(conn, sess)
+			} else {
+				c.tunnel(conn, sess, targetAddr, targetPort)
+			}
 			return
 		}
 		// sess is nil (no session yet) or closed (reconnect in progress) —
@@ -921,12 +934,51 @@ func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, ta
 	_, _ = io.Copy(conn, stream)
 }
 
+// tunnelUDP relays datagrams for a UDP-in-TCP client. Every datagram carries
+// its own destination, so unlike [Client.tunnel] there is nothing to dial up
+// front and the whole conversation is a byte stream the agent demultiplexes.
+func (c *Client) tunnelUDP(conn net.Conn, sess *smux.Session) {
+	stream, err := sess.OpenStream()
+	if err != nil {
+		logger.Warnf("socks: OpenStream failed for udp relay: %v", err)
+		_, _ = conn.Write(replyHostUnreachable())
+		return
+	}
+	defer func() { _ = stream.Close() }()
+
+	logger.Infof("socks: udp relay sid=%d", stream.ID())
+
+	if err := c.sendStreamRequest(stream, map[string]any{"cmd": "udp"}); err != nil {
+		logger.Warnf("socks: udp relay failed sid=%d: %v", stream.ID(), err)
+		_, _ = conn.Write(replyHostUnreachable())
+		return
+	}
+
+	if _, err := conn.Write(replySuccess()); err != nil {
+		return
+	}
+
+	go func() {
+		_, _ = io.Copy(stream, conn)
+		_ = stream.Close()
+	}()
+	_, _ = io.Copy(conn, stream)
+}
+
 func (c *Client) sendConnectRequest(stream *smux.Stream, targetAddr string, targetPort int) error {
-	connectReq, err := json.Marshal(map[string]any{
+	return c.sendStreamRequest(stream, map[string]any{
 		"cmd":  "connect",
 		"addr": targetAddr,
 		"port": targetPort,
 	})
+}
+
+// sendStreamRequest writes the opening request of a tunnel stream and waits for
+// the agent to acknowledge it. Data must not follow before the ack: the agent
+// reads the request by growing a buffer until it parses as JSON, so appended
+// bytes would keep it from ever parsing.
+func (c *Client) sendStreamRequest(stream *smux.Stream, request map[string]any) error {
+	connectReq, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("sid=%d marshal connect req: %w", stream.ID(), err)
 	}
@@ -1016,27 +1068,31 @@ func (c *Client) socks5UserPassAuth(conn net.Conn) error {
 	return nil
 }
 
-func (c *Client) socks5Request(conn net.Conn) (string, int, error) {
+// socks5Request reads a SOCKS5 request and returns its command along with the
+// requested destination. A UDP-in-TCP request carries a placeholder address
+// that the caller ignores, since each datagram names its own destination.
+func (c *Client) socks5Request(conn net.Conn) (byte, string, int, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", 0, fmt.Errorf("read socks5 request: %w", err)
+		return 0, "", 0, fmt.Errorf("read socks5 request: %w", err)
 	}
-	if header[1] != 1 {
-		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
+	cmd := header[1]
+	if cmd != socksCmdConnect && cmd != socks5udp.CmdUDPInTCP {
+		return 0, "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, cmd)
 	}
 
 	addr, err := c.readSocks5Addr(conn, header[3])
 	if err != nil {
-		return "", 0, err
+		return 0, "", 0, err
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", 0, fmt.Errorf("read socks5 port: %w", err)
+		return 0, "", 0, fmt.Errorf("read socks5 port: %w", err)
 	}
 	port := int(binary.BigEndian.Uint16(portBuf))
 
-	return addr, port, nil
+	return cmd, addr, port, nil
 }
 
 func (c *Client) readSocks5Addr(conn net.Conn, addrType byte) (string, error) {
