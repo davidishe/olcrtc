@@ -70,6 +70,17 @@ func (Provider) Issue(ctx context.Context, cfg auth.Config) (auth.Credentials, e
 	}
 
 	joined, err := joinConversationByLink(ctx, sessionKey, joinLink, anonymToken, true)
+	if err != nil && anonymToken != "" && isAnonymTokenOutdated(err) {
+		// Stale carrierAuthToken from a previous subscription keeps failing every
+		// connect. Drop it and mint a fresh guest anonymToken from this device IP.
+		logger.Infof("vkcalls: stored anonymToken outdated; minting a fresh one")
+		fresh, mintErr := resolveAnonymToken(ctx, sessionKey, joinLink, cfg.Name, "")
+		if mintErr != nil {
+			return auth.Credentials{}, err
+		}
+		anonymToken = fresh
+		joined, err = joinConversationByLink(ctx, sessionKey, joinLink, anonymToken, true)
+	}
 	if err != nil {
 		return auth.Credentials{}, err
 	}
@@ -137,6 +148,15 @@ func urlUserID(endpoint string) (string, error) {
 
 func parseEndpoint(endpoint string) (*url.URL, error) {
 	return url.Parse(endpoint)
+}
+
+func isAnonymTokenOutdated(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "anonym_token.outdated") ||
+		strings.Contains(msg, "anonym token outdated")
 }
 
 func init() { //nolint:gochecknoinits // auth registration is the canonical Go pattern for plugins
