@@ -91,6 +91,17 @@ type Client struct {
 	// established (sessionID != ""). Tunnel handlers wait on it so they do
 	// not open smux streams before the server has accepted the handshake.
 	sessionReady chan struct{}
+	// streamOpenSem limits concurrent CONNECT/UDP stream opens that are still
+	// waiting for the agent ACK. On high-latency turnrelay, unrestricted
+	// parallel opens starve KCP so ACKs and control pongs time out.
+	streamOpenSem chan struct{}
+	// socksStats aggregates connection-setup latency so the log carries a
+	// distribution instead of one info line per connection.
+	socksStats socksStats
+	// pipelineConnect is set when the agent advertised
+	// handshake.CapConnectPipeline. It is read on every tunnel open and
+	// rewritten on reconnect, hence atomic.
+	pipelineConnect atomic.Bool
 }
 
 // HealthFunc is called when the client control health snapshot changes.
@@ -178,6 +189,8 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 	if err := c.bringUpLink(runCtx, cfg, cancel); err != nil {
 		return err
 	}
+	c.initStreamOpenLimit()
+	go c.socksStats.reportLoop(runCtx.Done())
 
 	lc := net.ListenConfig{}
 	listener, err := lc.Listen(runCtx, "tcp4", cfg.LocalAddr)
@@ -261,7 +274,9 @@ func (c *Client) bringUpLink(
 		return err
 	}
 
-	control, sid, err := openControlStream(ctx, controlSess, c.deviceID, c.claims)
+	control, sid, err := openControlStreamTimeout(
+		ctx, controlSess, c.deviceID, c.claims,
+		runtime.HandshakeTimeout(c.ln), c.applyServerCaps)
 	if err != nil {
 		_ = sess.Close()
 		if controlSess != sess {
@@ -347,15 +362,19 @@ func openControlStream(
 	deviceID string,
 	claims map[string]any,
 ) (*smux.Stream, string, error) {
-	return openControlStreamTimeout(ctx, sess, deviceID, claims, handshake.DefaultTimeout)
+	return openControlStreamTimeout(ctx, sess, deviceID, claims, handshake.DefaultTimeout, nil)
 }
 
+// onCaps, when non-nil, receives the capability list the server advertised in
+// its welcome. It fires on every (re)handshake because a reconnect may land on
+// a differently versioned agent.
 func openControlStreamTimeout(
 	ctx context.Context,
 	sess *smux.Session,
 	deviceID string,
 	claims map[string]any,
 	timeout time.Duration,
+	onCaps func([]string),
 ) (*smux.Stream, string, error) {
 	stream, err := sess.OpenStream()
 	if err != nil {
@@ -371,7 +390,7 @@ func openControlStreamTimeout(
 	}()
 	defer close(done)
 	_ = stream.SetDeadline(time.Now().Add(timeout))
-	sid, err := handshake.Client(stream, deviceID, claims)
+	sid, caps, err := handshake.ClientWithCaps(stream, deviceID, claims)
 	_ = stream.SetDeadline(time.Time{})
 	if err != nil {
 		_ = stream.Close()
@@ -379,6 +398,9 @@ func openControlStreamTimeout(
 			return nil, "", fmt.Errorf("handshake client: %w", ctx.Err())
 		}
 		return nil, "", fmt.Errorf("handshake client: %w", err)
+	}
+	if onCaps != nil {
+		onCaps(caps)
 	}
 	return stream, sid, nil
 }
@@ -594,7 +616,9 @@ func (c *Client) tryReopenSession(
 		return false
 	}
 
-	ctrlStream, sid, err := openControlStreamTimeout(ctx, controlSess, c.deviceID, c.claims, handshake.DefaultTimeout)
+	ctrlStream, sid, err := openControlStreamTimeout(
+		ctx, controlSess, c.deviceID, c.claims,
+		runtime.HandshakeTimeout(c.ln), c.applyServerCaps)
 	if err != nil {
 		logger.Warnf("handshake on reconnect failed (attempt %d): %v", attempt, err)
 		_ = sess.Close()
@@ -632,8 +656,16 @@ func (c *Client) startControlLoop(
 	// packets under load. Conventional carriers (jitsi/datachannel) keep the
 	// conservative default so a dead link is detected promptly. A user-set
 	// timeout larger than the default is left untouched.
-	if runtime.IsControlPlane(c.ln) && liveness.Timeout <= control.DefaultTimeout {
+	if runtime.NeedsRelaxedDeadlines(c.ln) && liveness.Timeout <= control.DefaultTimeout {
 		liveness.Timeout = runtime.LivenessTimeout(c.ln)
+	}
+	if runtime.NeedsRelaxedDeadlines(c.ln) {
+		if liveness.Interval <= 0 || liveness.Interval <= control.DefaultInterval {
+			liveness.Interval = 15 * time.Second
+		}
+		if liveness.Failures <= 0 || liveness.Failures <= control.DefaultFailures {
+			liveness.Failures = 8
+		}
 	}
 	// ai-generated: pingInterval resolution + the watchControlStaleness
 	// launch below are new, peer-restart-corroboration PR.
@@ -831,6 +863,64 @@ func (c *Client) onData(data []byte) {
 	}
 }
 
+// applyServerCaps records which optional behaviours the agent supports. It is
+// called after every handshake, including reconnects, so a client that lands on
+// an older agent falls back instead of speaking a framing the peer cannot read.
+func (c *Client) applyServerCaps(caps []string) {
+	pipeline := false
+	for _, cap := range caps {
+		if cap == handshake.CapConnectPipeline {
+			pipeline = true
+			break
+		}
+	}
+	if c.pipelineConnect.Swap(pipeline) == pipeline {
+		return
+	}
+	if pipeline {
+		logger.Infof("socks: agent supports %s — sending payload with the request", handshake.CapConnectPipeline)
+	} else {
+		logger.Infof("socks: agent does not support %s — waiting for the request ack", handshake.CapConnectPipeline)
+	}
+}
+
+func (c *Client) initStreamOpenLimit() {
+	if c.ln == nil || !runtime.NeedsRelaxedDeadlines(c.ln) || !c.ln.Features().HighLatency {
+		return
+	}
+	// 3 in-flight CONNECT ACKs: enough for a page, small enough that KCP
+	// on 3G/TURN can deliver the 1-byte ACKs before ConnectAckTimeout.
+	const maxInflightOpens = 4
+	c.streamOpenSem = make(chan struct{}, maxInflightOpens)
+	logger.Infof("socks: limiting concurrent stream opens to %d (high-latency transport)", maxInflightOpens)
+}
+
+func (c *Client) acquireStreamOpen(ctx context.Context) error {
+	if c.streamOpenSem == nil {
+		return nil
+	}
+	// Cap how long a SOCKS dial waits for a free open-slot so the UI/browser
+	// can retry; do not inherit a short parent deadline from session warmup.
+	wait, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	select {
+	case c.streamOpenSem <- struct{}{}:
+		return nil
+	case <-wait.Done():
+		return wait.Err()
+	}
+}
+
+func (c *Client) releaseStreamOpen() {
+	if c.streamOpenSem == nil {
+		return
+	}
+	select {
+	case <-c.streamOpenSem:
+	default:
+	}
+}
+
 func (c *Client) acceptLoop(ctx context.Context, ln net.Listener) {
 	for {
 		conn, err := ln.Accept()
@@ -843,7 +933,11 @@ func (c *Client) acceptLoop(ctx context.Context, ln net.Listener) {
 				continue
 			}
 		}
-		logger.Infof("socks: accept from %s", conn.RemoteAddr())
+		// Per-connection bookkeeping stays behind verbose: a browsing session
+		// opens dozens of these a second, and inside the iOS packet-tunnel
+		// extension the logging itself distorts what we are measuring. The
+		// timing line in tunnel() and the periodic aggregate carry the signal.
+		logger.Debugf("socks: accept from %s", conn.RemoteAddr())
 		go c.handleSocks5(ctx, conn)
 	}
 }
@@ -856,7 +950,7 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		logger.Warnf("socks: handshake failed from %s: %v", remote, err)
 		return
 	}
-	logger.Infof("socks: handshake ok from %s", remote)
+	logger.Debugf("socks: handshake ok from %s", remote)
 
 	cmd, targetAddr, targetPort, err := c.socks5Request(conn)
 	if err != nil {
@@ -865,9 +959,9 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	}
 	udpRelay := cmd == socks5udp.CmdUDPInTCP
 	if udpRelay {
-		logger.Infof("socks: udp relay request from %s", remote)
+		logger.Debugf("socks: udp relay request from %s", remote)
 	} else {
-		logger.Infof("socks: request %s:%d from %s", targetAddr, targetPort, remote)
+		logger.Debugf("socks: request %s:%d from %s", targetAddr, targetPort, remote)
 	}
 
 	// Wait until the session handshake is fully complete (sessionID != "").
@@ -882,10 +976,13 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 		sid := c.sessionID
 		c.sessMu.RUnlock()
 		if sess != nil && !sess.IsClosed() && sid != "" {
+			// Use the long-lived run ctx for stream-open queueing. readyCtx is
+			// only for waiting until the session exists; reusing it made queued
+			// CONNECTs die at ~60s while 3 slots were still waiting on ACK.
 			if udpRelay {
-				c.tunnelUDP(conn, sess)
+				c.tunnelUDP(ctx, conn, sess)
 			} else {
-				c.tunnel(conn, sess, targetAddr, targetPort)
+				c.tunnel(ctx, conn, sess, targetAddr, targetPort)
 			}
 			return
 		}
@@ -905,23 +1002,56 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, targetPort int) {
+func (c *Client) tunnel(ctx context.Context, conn net.Conn, sess *smux.Session, targetAddr string, targetPort int) {
+	if err := c.acquireStreamOpen(ctx); err != nil {
+		logger.Warnf("socks: stream open queue timeout for %s:%d: %v", targetAddr, targetPort, err)
+		_, _ = conn.Write(replyHostUnreachable())
+		return
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			c.releaseStreamOpen()
+		}
+	}
+	defer release()
+
+	// Start the clock before OpenStream, not after: queueing behind the
+	// open-slot semaphore and the stream open itself are both part of what the
+	// user experiences as "the page is not loading yet".
+	openStart := time.Now()
+
 	stream, err := sess.OpenStream()
 	if err != nil {
 		logger.Warnf("socks: OpenStream failed for %s:%d: %v", targetAddr, targetPort, err)
+		c.socksStats.recordFailure()
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
 	defer func() { _ = stream.Close() }()
 
-	logger.Infof("socks: tunnel sid=%d → %s:%d", stream.ID(), targetAddr, targetPort)
+	logger.Debugf("socks: tunnel sid=%d → %s:%d", stream.ID(), targetAddr, targetPort)
+
+	if c.pipelineConnect.Load() {
+		c.tunnelPipelined(conn, stream, targetAddr, targetPort, openStart, release)
+		return
+	}
 
 	if err := c.sendConnectRequest(stream, targetAddr, targetPort); err != nil {
-		logger.Warnf("socks: connect failed sid=%d → %s:%d: %v", stream.ID(), targetAddr, targetPort, err)
+		logger.Warnf("socks: connect failed sid=%d → %s:%d after %s: %v",
+			stream.ID(), targetAddr, targetPort, roundMillis(time.Since(openStart)), err)
+		c.socksStats.recordFailure()
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
-	logger.Infof("socks: connected sid=%d → %s:%d", stream.ID(), targetAddr, targetPort)
+	// Millisecond resolution and a ready-made duration, matching the agent's
+	// "connected … in Xms". Comparing the two sides is the whole measurement.
+	elapsed := time.Since(openStart)
+	c.socksStats.recordOpen(elapsed)
+	logger.Infof("socks: connected sid=%d → %s:%d in %s",
+		stream.ID(), targetAddr, targetPort, roundMillis(elapsed))
+	release() // ACK done — free the slot for other opens while data copies.
 
 	if _, err := conn.Write(replySuccess()); err != nil {
 		return
@@ -931,28 +1061,111 @@ func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, ta
 		_, _ = io.Copy(stream, conn)
 		_ = stream.Close()
 	}()
+	_, _ = io.Copy(conn, stream)
+}
+
+// tunnelPipelined opens a tunnel connection without spending a round trip
+// waiting for the agent's ack.
+//
+// The legacy path costs the browser two round trips before its request reaches
+// the target: one for CONNECT→ack, and one more for the request itself, which
+// the browser only sends after we report success. Here we answer the browser
+// immediately, so its request travels behind our CONNECT in the same flight,
+// and the ack is collected on the read side while that is in flight.
+//
+// The trade is honest and bounded: the SOCKS success reply now means "the
+// request is on its way", not "the target answered". When the dial fails the
+// agent closes the stream, we see it on the ack read, and the browser gets a
+// closed connection instead of a SOCKS error — the same outcome it already
+// handles when a server hangs up early.
+func (c *Client) tunnelPipelined(
+	conn net.Conn,
+	stream *smux.Stream,
+	targetAddr string,
+	targetPort int,
+	openStart time.Time,
+	release func(),
+) {
+	req := connectRequestFields(targetAddr, targetPort)
+	if err := c.writeStreamRequest(stream, req, true); err != nil {
+		logger.Warnf("socks: connect failed sid=%d → %s:%d after %s: %v",
+			stream.ID(), targetAddr, targetPort, roundMillis(time.Since(openStart)), err)
+		c.socksStats.recordFailure()
+		_, _ = conn.Write(replyHostUnreachable())
+		return
+	}
+	// The request is written, so the slot has served its purpose: nothing is
+	// left in flight that the open limiter is meant to pace.
+	release()
+
+	if _, err := conn.Write(replySuccess()); err != nil {
+		return
+	}
+
+	// Upstream starts now: this is the request that used to wait a full round
+	// trip for our SOCKS reply.
+	go func() {
+		_, _ = io.Copy(stream, conn)
+		_ = stream.Close()
+	}()
+
+	// The ack still gates downstream data, so setup latency is measured at the
+	// same point as on the legacy path and stays comparable with the agent's
+	// "connected … in Xms".
+	if err := c.awaitStreamAck(stream); err != nil {
+		logger.Warnf("socks: connect failed sid=%d → %s:%d after %s: %v",
+			stream.ID(), targetAddr, targetPort, roundMillis(time.Since(openStart)), err)
+		c.socksStats.recordFailure()
+		return
+	}
+	elapsed := time.Since(openStart)
+	c.socksStats.recordOpen(elapsed)
+	logger.Infof("socks: connected sid=%d → %s:%d in %s (pipelined)",
+		stream.ID(), targetAddr, targetPort, roundMillis(elapsed))
+
 	_, _ = io.Copy(conn, stream)
 }
 
 // tunnelUDP relays datagrams for a UDP-in-TCP client. Every datagram carries
 // its own destination, so unlike [Client.tunnel] there is nothing to dial up
 // front and the whole conversation is a byte stream the agent demultiplexes.
-func (c *Client) tunnelUDP(conn net.Conn, sess *smux.Session) {
+func (c *Client) tunnelUDP(ctx context.Context, conn net.Conn, sess *smux.Session) {
+	if err := c.acquireStreamOpen(ctx); err != nil {
+		logger.Warnf("socks: stream open queue timeout for udp relay: %v", err)
+		_, _ = conn.Write(replyHostUnreachable())
+		return
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			c.releaseStreamOpen()
+		}
+	}
+	defer release()
+
+	openStart := time.Now()
+
 	stream, err := sess.OpenStream()
 	if err != nil {
 		logger.Warnf("socks: OpenStream failed for udp relay: %v", err)
+		c.socksStats.recordFailure()
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
 	defer func() { _ = stream.Close() }()
 
-	logger.Infof("socks: udp relay sid=%d", stream.ID())
+	logger.Debugf("socks: udp relay sid=%d", stream.ID())
 
 	if err := c.sendStreamRequest(stream, map[string]any{"cmd": "udp"}); err != nil {
-		logger.Warnf("socks: udp relay failed sid=%d: %v", stream.ID(), err)
+		logger.Warnf("socks: udp relay failed sid=%d after %s: %v",
+			stream.ID(), roundMillis(time.Since(openStart)), err)
+		c.socksStats.recordFailure()
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
+	c.socksStats.recordOpen(time.Since(openStart))
+	release()
 
 	if _, err := conn.Write(replySuccess()); err != nil {
 		return
@@ -965,22 +1178,32 @@ func (c *Client) tunnelUDP(conn net.Conn, sess *smux.Session) {
 	_, _ = io.Copy(conn, stream)
 }
 
-func (c *Client) sendConnectRequest(stream *smux.Stream, targetAddr string, targetPort int) error {
-	return c.sendStreamRequest(stream, map[string]any{
+func connectRequestFields(targetAddr string, targetPort int) map[string]any {
+	return map[string]any{
 		"cmd":  "connect",
 		"addr": targetAddr,
 		"port": targetPort,
-	})
+	}
 }
 
-// sendStreamRequest writes the opening request of a tunnel stream and waits for
-// the agent to acknowledge it. Data must not follow before the ack: the agent
-// reads the request by growing a buffer until it parses as JSON, so appended
-// bytes would keep it from ever parsing.
-func (c *Client) sendStreamRequest(stream *smux.Stream, request map[string]any) error {
+func (c *Client) sendConnectRequest(stream *smux.Stream, targetAddr string, targetPort int) error {
+	return c.sendStreamRequest(stream, connectRequestFields(targetAddr, targetPort))
+}
+
+// writeStreamRequest writes the opening request of a tunnel stream.
+//
+// Without CapConnectPipeline the request must be the only thing on the stream
+// until the agent acks it: that agent reads the request by growing a buffer
+// until it parses as JSON, so appended bytes would keep it from ever parsing.
+// With the capability the request is newline-terminated, which delimits it
+// unambiguously and lets payload follow immediately.
+func (c *Client) writeStreamRequest(stream *smux.Stream, request map[string]any, pipelined bool) error {
 	connectReq, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("sid=%d marshal connect req: %w", stream.ID(), err)
+	}
+	if pipelined {
+		connectReq = append(connectReq, '\n')
 	}
 
 	_ = stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -988,18 +1211,31 @@ func (c *Client) sendStreamRequest(stream *smux.Stream, request map[string]any) 
 		return fmt.Errorf("sid=%d write connect req: %w", stream.ID(), err)
 	}
 	_ = stream.SetWriteDeadline(time.Time{})
+	return nil
+}
 
+// awaitStreamAck blocks until the agent confirms it reached the target.
+// ControlPlane transports (vp8channel peer-routing) may take ~30s for the SFU
+// to complete renegotiation and start forwarding data frames, so they get a
+// generous deadline. Conventional carriers (jitsi/datachannel) use the
+// conservative window so a stuck CONNECT fails fast.
+func (c *Client) awaitStreamAck(stream *smux.Stream) error {
 	ack := make([]byte, 1)
-	// ControlPlane transports (vp8channel peer-routing) may take ~30s for the
-	// SFU to complete renegotiation and start forwarding data frames, so they
-	// get a generous deadline. Conventional carriers (jitsi/datachannel) use
-	// the conservative window so a stuck CONNECT fails fast.
 	_ = stream.SetReadDeadline(time.Now().Add(runtime.ConnectAckTimeout(c.ln)))
 	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x00 {
 		return fmt.Errorf("sid=%d: %w (read_err=%w ack=%v)", stream.ID(), ErrRemoteNotReady, err, ack)
 	}
 	_ = stream.SetReadDeadline(time.Time{})
 	return nil
+}
+
+// sendStreamRequest writes the opening request and waits for the ack.
+func (c *Client) sendStreamRequest(stream *smux.Stream, request map[string]any) error {
+	if err := c.writeStreamRequest(stream, request, false); err != nil {
+		return err
+	}
+
+	return c.awaitStreamAck(stream)
 }
 
 func (c *Client) socks5Handshake(conn net.Conn) error {

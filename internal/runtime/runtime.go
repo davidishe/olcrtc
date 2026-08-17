@@ -103,23 +103,35 @@ func IsControlPlane(tr transport.Transport) bool {
 	return ok
 }
 
+// NeedsRelaxedDeadlines reports whether CONNECT-ack / control-pong windows
+// should be widened (isolated control plane or high-latency UDP like turnrelay).
+func NeedsRelaxedDeadlines(tr transport.Transport) bool {
+	if IsControlPlane(tr) {
+		return true
+	}
+	return tr != nil && tr.Features().HighLatency
+}
+
 // SmuxConfigFor returns the data-plane smux config appropriate for the
-// transport: relaxed keep-alive for ControlPlane carriers, conservative
-// otherwise.
+// transport: relaxed keep-alive for ControlPlane / high-latency carriers,
+// conservative otherwise.
 func SmuxConfigFor(tr transport.Transport) *smux.Config {
 	maxWirePayload := MaxPayload(tr)
-	if IsControlPlane(tr) {
+	if NeedsRelaxedDeadlines(tr) {
 		return SmuxConfigLong(maxWirePayload)
 	}
 	return SmuxConfig(maxWirePayload)
 }
 
 // LivenessTimeout returns the control-stream pong timeout for a transport:
-// a relaxed window for ControlPlane transports (KCP batching + frame pacing
-// can delay control packets under load), and the conservative default for
-// conventional carriers so dead links are detected quickly.
+// a relaxed window for ControlPlane / high-latency UDP (KCP batching, TURN
+// loss, cellular RTT), and the conservative default for conventional carriers
+// so dead links are detected quickly.
 func LivenessTimeout(tr transport.Transport) time.Duration {
-	if IsControlPlane(tr) {
+	if NeedsRelaxedDeadlines(tr) {
+		if tr != nil && tr.Features().HighLatency {
+			return 60 * time.Second
+		}
 		return 45 * time.Second
 	}
 	return control.DefaultTimeout
@@ -127,13 +139,27 @@ func LivenessTimeout(tr transport.Transport) time.Duration {
 
 // ConnectAckTimeout returns the tunnel CONNECT ack read deadline for a
 // transport. ControlPlane transports (SFU renegotiation) may take ~30s to
-// start forwarding data frames, so they get a generous window; conventional
-// carriers use the conservative default.
+// start forwarding data frames; high-latency turnrelay needs room for KCP
+// retransmits of the 1-byte ACK on cellular. Conventional carriers use the
+// conservative default.
 func ConnectAckTimeout(tr transport.Transport) time.Duration {
-	if IsControlPlane(tr) {
+	if NeedsRelaxedDeadlines(tr) {
+		if tr != nil && tr.Features().HighLatency {
+			return 45 * time.Second
+		}
 		return 90 * time.Second
 	}
 	return 15 * time.Second
+}
+
+// HandshakeTimeout bounds CLIENT_HELLO → SERVER_WELCOME on the control
+// stream. Cellular turnrelay often needs longer than the 45s default when
+// the first KCP flight is lossy.
+func HandshakeTimeout(tr transport.Transport) time.Duration {
+	if NeedsRelaxedDeadlines(tr) && tr != nil && tr.Features().HighLatency {
+		return 90 * time.Second
+	}
+	return 45 * time.Second
 }
 
 // ControlSmuxConfig returns a lean smux config for the isolated control-plane

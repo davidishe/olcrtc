@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,11 @@ const (
 	// destination travels with each datagram rather than in the request.
 	udpCommand = "udp"
 )
+
+// serverCaps are the optional behaviours this agent advertises in the welcome.
+// Clients that do not recognise an entry ignore it, so adding one here is
+// always safe for older clients.
+var serverCaps = []string{handshake.CapConnectPipeline}
 
 var (
 	// ErrKeyRequired re-exports runtime.ErrKeyRequired for compatibility with
@@ -104,11 +110,15 @@ type Server struct {
 	socksProxyPort int
 	socksProxyUser string
 	socksProxyPass string
-	liveness       control.Config
-	health         *runtime.HealthTracker
-	done           chan struct{}
-	doneOnce       sync.Once
-	startCfg       Config
+	// dialGuard short-circuits repeat dials to addresses that just timed out,
+	// so a retrying background service on the client cannot spend ten seconds
+	// of tunnel capacity per attempt.
+	dialGuard *dialGuard
+	liveness  control.Config
+	health    *runtime.HealthTracker
+	done      chan struct{}
+	doneOnce  sync.Once
+	startCfg  Config
 }
 
 // peerStat holds the per-session info needed to report the live peer count
@@ -223,6 +233,7 @@ func New(cfg Config) (*Server, error) {
 		health:         runtime.NewHealthTracker(cfg.OnHealth),
 		peerSessions:   make(map[string]*peerSession),
 		peerStats:      make(map[string]peerStat),
+		dialGuard:      newDialGuard(),
 		done:           make(chan struct{}),
 		startCfg:       cfg,
 	}
@@ -1008,8 +1019,8 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 			s.reinstallSession(sess)
 			return false
 		}
-		_ = stream.SetDeadline(time.Now().Add(handshake.DefaultTimeout))
-		hello, sid, err := handshake.Server(stream, s.authHook)
+		_ = stream.SetDeadline(time.Now().Add(runtime.HandshakeTimeout(s.ln)))
+		hello, sid, err := handshake.ServerWithCaps(stream, s.authHook, serverCaps)
 		_ = stream.SetDeadline(time.Time{})
 		if err != nil {
 			_ = stream.Close()
@@ -1054,8 +1065,8 @@ func (s *Server) acceptPeerHandshake(ctx context.Context, ps *peerSession) {
 			s.removePeerSession(ps.peerID, "handshake failed")
 			return
 		}
-		_ = stream.SetDeadline(time.Now().Add(handshake.DefaultTimeout))
-		hello, sid, err := handshake.Server(stream, s.authHook)
+		_ = stream.SetDeadline(time.Now().Add(runtime.HandshakeTimeout(s.ln)))
+		hello, sid, err := handshake.ServerWithCaps(stream, s.authHook, serverCaps)
 		_ = stream.SetDeadline(time.Time{})
 		if err != nil {
 			_ = stream.Close()
@@ -1094,8 +1105,16 @@ func (s *Server) startPeerControlLoop(ctx context.Context, ps *peerSession, stre
 	s.sessMu.Unlock()
 
 	liveness := s.liveness
-	if runtime.IsControlPlane(s.ln) && liveness.Timeout <= control.DefaultTimeout {
+	if runtime.NeedsRelaxedDeadlines(s.ln) && liveness.Timeout <= control.DefaultTimeout {
 		liveness.Timeout = runtime.LivenessTimeout(s.ln)
+	}
+	if runtime.NeedsRelaxedDeadlines(s.ln) {
+		if liveness.Interval <= 0 || liveness.Interval <= control.DefaultInterval {
+			liveness.Interval = 15 * time.Second
+		}
+		if liveness.Failures <= 0 || liveness.Failures <= control.DefaultFailures {
+			liveness.Failures = 8
+		}
 	}
 	onPong := liveness.OnPong
 	onMissedPong := liveness.OnMissedPong
@@ -1224,12 +1243,18 @@ func (s *Server) startControlLoop(ctx context.Context, sess *smux.Session, strea
 	s.sessMu.Unlock()
 
 	liveness := s.liveness
-	// Relax the pong timeout only for transports with an isolated control
-	// plane (vp8channel); conventional carriers keep the conservative default
-	// so dead links are detected and reconnected promptly. A user-set timeout
-	// larger than the default is left untouched.
-	if runtime.IsControlPlane(s.ln) && liveness.Timeout <= control.DefaultTimeout {
+	// Relax pong timeout for ControlPlane / high-latency UDP (turnrelay on
+	// cellular). Conventional carriers keep the conservative default.
+	if runtime.NeedsRelaxedDeadlines(s.ln) && liveness.Timeout <= control.DefaultTimeout {
 		liveness.Timeout = runtime.LivenessTimeout(s.ln)
+	}
+	if runtime.NeedsRelaxedDeadlines(s.ln) {
+		if liveness.Interval <= 0 || liveness.Interval <= control.DefaultInterval {
+			liveness.Interval = 15 * time.Second
+		}
+		if liveness.Failures <= 0 || liveness.Failures <= control.DefaultFailures {
+			liveness.Failures = 8
+		}
 	}
 	onPong := liveness.OnPong
 	onMissedPong := liveness.OnMissedPong
@@ -1320,9 +1345,14 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 		sessionID = s.currentSessionID()
 	}
 
-	// Read the connect JSON. The client writes the whole JSON in one
-	// stream.Write so it usually arrives intact; tolerate fragmentation
-	// by reading incrementally up to a sane cap.
+	// Read the opening request. Two framings arrive here:
+	//
+	//   legacy    {json}            — nothing may follow until we ack
+	//   pipelined {json}\n<payload> — first payload bytes ride along
+	//
+	// Both are accepted so a client and an agent can be upgraded in either
+	// order. The client only uses the pipelined form when the welcome
+	// advertised handshake.CapConnectPipeline.
 	const maxConnReq = 4096
 	header := make([]byte, 0, 256)
 	tmp := make([]byte, 256)
@@ -1331,13 +1361,13 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 		n, err := stream.Read(tmp)
 		if n > 0 {
 			header = append(header, tmp[:n]...)
-			if req, ok := parseConnectRequest(header); ok {
+			if req, early, ok := parseStreamRequest(header); ok {
 				_ = stream.SetReadDeadline(time.Time{})
 				if req.Cmd == udpCommand {
 					s.relayUDP(stream, sessionID)
 					return
 				}
-				s.dispatch(stream, req, sessionID)
+				s.dispatch(stream, req, early, sessionID)
 				return
 			}
 		}
@@ -1348,6 +1378,23 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 			return
 		}
 	}
+}
+
+// parseStreamRequest splits the opening request from any payload the client
+// pipelined behind it. ok is false while the request is still incomplete, so
+// the caller keeps reading.
+func parseStreamRequest(buf []byte) (req ConnectRequest, early []byte, ok bool) {
+	// Pipelined framing: the newline delimits the request, so payload behind
+	// it does not have to parse as JSON.
+	if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+		if req, ok := parseConnectRequest(buf[:i]); ok {
+			return req, buf[i+1:], true
+		}
+		// A newline that does not close a valid request means this is not the
+		// pipelined framing; fall through to the legacy whole-buffer parse.
+	}
+	req, ok = parseConnectRequest(buf)
+	return req, nil, ok
 }
 
 func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
@@ -1457,24 +1504,52 @@ func (s *Server) DisconnectDevice(deviceID string) int {
 	return closed
 }
 
-func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID string) {
+// dispatch dials the requested target and splices it to the stream. early
+// carries the bytes a pipelining client sent behind its request; they are
+// written to the target before the copy loop starts, which is what lets the
+// client skip waiting for the ack.
+func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, early []byte, sessionID string) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
-	logger.Infof("sid=%d connect %s", stream.ID(), addr)
+	logger.Debugf("sid=%d connect %s", stream.ID(), addr)
+
+	if s.dialGuard.blocked(addr) {
+		logger.Debugf("sid=%d dial %s: %v", stream.ID(), addr, errDialSuppressed)
+		return
+	}
 
 	dialStart := time.Now()
 	conn, err := s.dial(req)
 	dialElapsed := time.Since(dialStart)
 
 	if err != nil {
+		if isTimeout(err) && s.dialGuard.recordTimeout(addr) {
+			logger.Warnf("sid=%d dial %s timed out %d times in a row — suppressing for %s",
+				stream.ID(), addr, dialGuardThreshold, dialGuardCooldown)
+		}
 		logger.Infof("sid=%d dial %s failed (%v): %v", stream.ID(), addr, dialElapsed, err)
 		return
 	}
+	s.dialGuard.recordSuccess(addr)
 	defer func() { _ = conn.Close() }()
 
 	logger.Infof("sid=%d connected %s in %v", stream.ID(), addr, dialElapsed)
 
 	if _, err := stream.Write([]byte{0x00}); err != nil {
 		return
+	}
+
+	earlyBytes := uint64(0)
+	if len(early) > 0 {
+		n, err := conn.Write(early)
+		if n > 0 {
+			earlyBytes = uint64(n)
+		}
+		if err != nil {
+			logger.Warnf("sid=%d early payload to %s failed after %d/%d bytes: %v",
+				stream.ID(), addr, n, len(early), err)
+			return
+		}
+		logger.Debugf("sid=%d pipelined %d early bytes to %s", stream.ID(), n, addr)
 	}
 
 	var bytesOut uint64
@@ -1488,6 +1563,7 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID str
 		close(done)
 	}()
 	in, _ := io.Copy(conn, stream)
+	in += int64(earlyBytes)
 	_ = conn.Close()
 	<-done
 	bytesIn := uint64(0)

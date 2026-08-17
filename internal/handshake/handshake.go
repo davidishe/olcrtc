@@ -67,7 +67,18 @@ type Welcome struct {
 	Version   int     `json:"version"`
 	Type      MsgType `json:"type"`
 	SessionID string  `json:"session_id"`
+	// Caps lists optional behaviours this server supports, so a client can use
+	// a faster path only when the peer understands it. Unknown caps must be
+	// ignored, and an absent list means "none" — that is what makes this
+	// forward and backward compatible without bumping ProtoVersion.
+	Caps []string `json:"caps,omitempty"`
 }
+
+// CapConnectPipeline advertises that the server accepts a newline-terminated
+// tunnel request with the first payload bytes appended directly behind it,
+// instead of requiring the client to wait for the request ack before sending
+// anything. It removes one full round trip from every tunnel connection.
+const CapConnectPipeline = "connect-pipeline"
 
 // Reject is the server's response when auth fails.
 type Reject struct {
@@ -95,8 +106,21 @@ var (
 type AuthFunc func(deviceID string, claims map[string]any) (sessionID string, err error)
 
 // Client performs the client side of the handshake on rw and returns the
-// session ID assigned by the server.
+// session ID assigned by the server. Use [ClientWithCaps] to also learn which
+// optional behaviours the server supports.
 func Client(rw io.ReadWriter, deviceID string, claims map[string]any) (string, error) {
+	sid, _, err := ClientWithCaps(rw, deviceID, claims)
+	return sid, err
+}
+
+// ClientWithCaps is [Client] plus the server's advertised capability list. A
+// server that predates capabilities returns an empty list, so callers must
+// treat "no caps" as the conservative path rather than an error.
+func ClientWithCaps(
+	rw io.ReadWriter,
+	deviceID string,
+	claims map[string]any,
+) (string, []string, error) {
 	hello := Hello{
 		Version:  ProtoVersion,
 		Type:     TypeHello,
@@ -104,57 +128,65 @@ func Client(rw io.ReadWriter, deviceID string, claims map[string]any) (string, e
 		Claims:   claims,
 	}
 	if err := writeFrame(rw, hello); err != nil {
-		return "", fmt.Errorf("send hello: %w", err)
+		return "", nil, fmt.Errorf("send hello: %w", err)
 	}
 
 	raw, err := readFrame(rw)
 	if err != nil {
-		return "", fmt.Errorf("read welcome: %w", err)
+		return "", nil, fmt.Errorf("read welcome: %w", err)
 	}
 
 	var probe struct {
 		Type MsgType `json:"type"`
 	}
 	if err := json.Unmarshal(raw, &probe); err != nil {
-		return "", fmt.Errorf("parse reply: %w", err)
+		return "", nil, fmt.Errorf("parse reply: %w", err)
 	}
 
 	switch probe.Type {
 	case TypeHello:
-		return "", fmt.Errorf("%w: got %q", ErrUnexpectedMessage, probe.Type)
+		return "", nil, fmt.Errorf("%w: got %q", ErrUnexpectedMessage, probe.Type)
 	case TypeWelcome:
 		return parseWelcome(raw)
 	case TypeReject:
 		return parseReject(raw)
 	default:
-		return "", fmt.Errorf("%w: got %q", ErrUnexpectedMessage, probe.Type)
+		return "", nil, fmt.Errorf("%w: got %q", ErrUnexpectedMessage, probe.Type)
 	}
 }
 
-func parseWelcome(raw []byte) (string, error) {
+func parseWelcome(raw []byte) (string, []string, error) {
 	var w Welcome
 	if err := json.Unmarshal(raw, &w); err != nil {
-		return "", fmt.Errorf("parse welcome: %w", err)
+		return "", nil, fmt.Errorf("parse welcome: %w", err)
 	}
 	if w.Version != ProtoVersion {
-		return "", fmt.Errorf("%w: server v%d, client v%d",
+		return "", nil, fmt.Errorf("%w: server v%d, client v%d",
 			ErrProtocolVersion, w.Version, ProtoVersion)
 	}
-	return w.SessionID, nil
+	return w.SessionID, w.Caps, nil
 }
 
-func parseReject(raw []byte) (string, error) {
+func parseReject(raw []byte) (string, []string, error) {
 	var r Reject
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return "", fmt.Errorf("parse reject: %w", err)
+		return "", nil, fmt.Errorf("parse reject: %w", err)
 	}
-	return "", fmt.Errorf("%w: %s", ErrRejected, r.Reason)
+	return "", nil, fmt.Errorf("%w: %s", ErrRejected, r.Reason)
 }
 
-// Server performs the server side of the handshake. It reads CLIENT_HELLO,
-// invokes auth, and writes the corresponding WELCOME or REJECT. On success it
-// returns the parsed Hello and the session ID produced by auth.
+// Server performs the server side of the handshake without advertising any
+// optional capabilities. See [ServerWithCaps].
 func Server(rw io.ReadWriter, auth AuthFunc) (Hello, string, error) {
+	return ServerWithCaps(rw, auth, nil)
+}
+
+// ServerWithCaps performs the server side of the handshake. It reads
+// CLIENT_HELLO, invokes auth, and writes the corresponding WELCOME or REJECT.
+// caps is advertised in the welcome so clients can opt into faster paths; old
+// clients ignore the field. On success it returns the parsed Hello and the
+// session ID produced by auth.
+func ServerWithCaps(rw io.ReadWriter, auth AuthFunc, caps []string) (Hello, string, error) {
 	raw, err := readFrame(rw)
 	if err != nil {
 		return Hello{}, "", fmt.Errorf("read hello: %w", err)
@@ -185,6 +217,7 @@ func Server(rw io.ReadWriter, auth AuthFunc) (Hello, string, error) {
 		Version:   ProtoVersion,
 		Type:      TypeWelcome,
 		SessionID: sessionID,
+		Caps:      caps,
 	}); err != nil {
 		return h, sessionID, fmt.Errorf("send welcome: %w", err)
 	}

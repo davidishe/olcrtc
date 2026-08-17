@@ -26,6 +26,10 @@ type Features struct {
 	Ordered         bool
 	MessageOriented bool
 	MaxPayloadSize  int
+	// HighLatency marks lossy/high-RTT paths (e.g. KCP over TURN on cellular).
+	// Callers use this to relax CONNECT ack and control-pong deadlines so
+	// brief stalls do not tear down a still-recoverable link.
+	HighLatency bool
 }
 
 // Transport defines a byte transport independent of the underlying carrier.

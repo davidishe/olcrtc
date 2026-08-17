@@ -19,9 +19,48 @@ import (
 )
 
 const (
-	defaultMaxPayload   = 32 * 1024
-	kcpDataShard        = 10
-	kcpParityShard      = 3
+	// Keep smux frames modest on cellular, but not so tiny that throughput
+	// collapses once CONNECT ACKs are reliable.
+	defaultMaxPayload = 8 * 1024
+	kcpDataShard      = 10
+	kcpParityShard    = 5
+
+	// Path budget for one KCP datagram. Every term is what it costs us to put
+	// a KCP packet on the wire through a TURN relay:
+	//
+	//   pathMTUFloor  1400  worst path MTU we expect (mobile carriers, PPPoE)
+	//   − ipv4Header    20  outer IP header (IPv6 would take 40, see slack)
+	//   − udpHeader      8  outer UDP header
+	//   − turnOverhead  36  TURN Send indication: STUN header 20 +
+	//                       XOR-PEER-ADDRESS 12 + DATA attribute header 4.
+	//                       ChannelData mode costs only 4, so 36 is the
+	//                       pessimistic of the two modes.
+	//   = 1336           ceiling above which the datagram fragments
+	//
+	// Fragmented UDP is lost as a whole, and one lost fragment costs a
+	// retransmit of the entire KCP packet — so we stay deliberately below the
+	// ceiling rather than at it. kcpMTU keeps ~236 bytes of slack for IPv6
+	// (20 more bytes of header) and for carrier encapsulation we cannot see.
+	// Raising it toward kcpMTUCeiling is a measured experiment, not a tidy-up:
+	// verify with the kcp telemetry that retrans does not grow.
+	pathMTUFloor  = 1400
+	ipv4Header    = 20
+	udpHeader     = 8
+	turnOverhead  = 36
+	kcpMTUCeiling = pathMTUFloor - ipv4Header - udpHeader - turnOverhead
+	kcpMTU        = 1100
+
+	kcpSndWnd = 512
+	kcpRcvWnd = 1024
+
+	// Socket buffers. The bandwidth-delay product of this path is small — at
+	// ~140 ms RTT and 10 Mbit/s it is under 200 KB — so the client gets 512 KB
+	// (comfortable headroom) instead of 4 MB. The client half runs inside
+	// NEPacketTunnelProvider, whose memory ceiling is a kill, not a slowdown.
+	// The agent has no such ceiling and serves many peers, so it keeps 4 MB.
+	clientSocketBuffer = 512 * 1024
+	agentSocketBuffer  = 4 * 1024 * 1024
+
 	acceptBackoff       = 200 * time.Millisecond
 	defaultListenAddr   = "0.0.0.0:56000"
 	turnAllocateTimeout = 30 * time.Second
@@ -124,6 +163,7 @@ func (t *Transport) Connect(ctx context.Context) error {
 		}
 	}
 	t.connected.Store(true)
+	t.startTelemetry()
 	return nil
 }
 
@@ -186,7 +226,7 @@ func (t *Transport) connectClient(ctx context.Context) error {
 		}
 		return fmt.Errorf("kcp dial %s: %w", endpoint, err)
 	}
-	tuneKCP(sess)
+	tuneKCP(sess, kcpRoleClient)
 
 	t.mu.Lock()
 	t.client = sess
@@ -278,13 +318,38 @@ func listenProtectedUDP() (net.PacketConn, error) {
 	return pc, nil
 }
 
-func tuneKCP(sess *kcp.UDPSession) {
-	sess.SetNoDelay(1, 10, 2, 1)
-	sess.SetWindowSize(1024, 1024)
+// tuneKCP configures one session. role selects the socket buffer budget: the
+// client runs inside an iOS packet-tunnel extension with a hard memory ceiling,
+// the agent does not.
+func tuneKCP(sess *kcp.UDPSession, role kcpRole) {
+	// Balanced for cellular: reliable enough for ACK delivery, enough window
+	// for usable browsing. WriteDelay off — it capped throughput on 3G.
+	sess.SetNoDelay(0, 30, 2, 1)
+	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
+	sess.SetMtu(kcpMTU)
 	sess.SetStreamMode(true)
+	sess.SetWriteDelay(false)
+	// Acknowledge immediately instead of waiting for the next flush. Web
+	// traffic is a stream of short interactive exchanges, so a deferred ACK
+	// adds latency to every one of them. vp8channel already does this.
+	sess.SetACKNoDelay(true)
 	_ = sess.SetDSCP(0)
-	_ = sess.SetReadBuffer(4 * 1024 * 1024)
-	_ = sess.SetWriteBuffer(4 * 1024 * 1024)
+	_ = sess.SetReadBuffer(role.socketBuffer())
+	_ = sess.SetWriteBuffer(role.socketBuffer())
+}
+
+type kcpRole int
+
+const (
+	kcpRoleClient kcpRole = iota
+	kcpRoleAgent
+)
+
+func (r kcpRole) socketBuffer() int {
+	if r == kcpRoleClient {
+		return clientSocketBuffer
+	}
+	return agentSocketBuffer
 }
 
 func (t *Transport) readClientLoop(sess *kcp.UDPSession) {
@@ -318,7 +383,7 @@ func (t *Transport) acceptLoop(ln *kcp.Listener) {
 			time.Sleep(acceptBackoff)
 			continue
 		}
-		tuneKCP(sess)
+		tuneKCP(sess, kcpRoleAgent)
 		peerID := t.registerPeer(sess)
 		logger.Infof("turnrelay: accepted peer=%s remote=%s", peerID, sess.RemoteAddr())
 		t.wg.Add(1)
@@ -532,6 +597,7 @@ func (t *Transport) Features() transport.Features {
 		Ordered:         true,
 		MessageOriented: true,
 		MaxPayloadSize:  defaultMaxPayload,
+		HighLatency:     true,
 	}
 }
 
