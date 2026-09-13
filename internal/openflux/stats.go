@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -188,6 +189,9 @@ func (s *stats) snapshot(c *docConn, outQLen, flows int) (string, bool) {
 	if q := s.dnsQ.Load(); q > 0 {
 		fmt.Fprintf(&b, " dnsavg=%dms dnsmax=%dms", s.dnsMsTotal.Load()/max(s.dnsOK.Load(), 1), s.dnsMsMax.take())
 	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(&b, " goheap=%dMB gosys=%dMB gc=%d", ms.HeapAlloc>>20, ms.Sys>>20, ms.NumGC)
 	switch {
 	case s.probeTxt != "":
 		fmt.Fprintf(&b, " | %s", s.probeTxt)

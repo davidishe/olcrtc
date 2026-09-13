@@ -15,6 +15,7 @@ package openflux
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -29,6 +30,12 @@ const (
 	probePeriod  = 2 * time.Second
 	keepAlive    = 10 * time.Second
 	stallTimeout = 5 * time.Second
+
+	// iOS kills a Packet Tunnel extension at roughly 50 MB. Without a soft limit
+	// the Go heap grew with traffic and jetsam killed the tunnel mid-video
+	// (13.09.2026: 9 MB -> 38 MB in 10 s, then silence).
+	memoryLimit = 30 << 20
+	gcPercent   = 20
 )
 
 var (
@@ -56,6 +63,8 @@ func Start(docURL string) (*Tunnel, error) {
 	if docURL == "" {
 		return nil, ErrDocURLRequired
 	}
+	debug.SetMemoryLimit(memoryLimit)
+	debug.SetGCPercent(gcPercent)
 	ctx, cancel := context.WithCancel(context.Background())
 	st := newStats()
 	t := &Tunnel{
