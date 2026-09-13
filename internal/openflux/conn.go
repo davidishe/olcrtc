@@ -2,7 +2,8 @@
 
 package openflux
 
-// ai-generated: document websocket session, reconnect, frame parsing.
+// ai-generated: document frame parsing, dedup, and per-packet accounting.
+// The session lifecycle (dial, read, seamless rotation) lives in session.go.
 
 import (
 	"context"
@@ -10,17 +11,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/gorilla/websocket"
-
-	"github.com/openlibrecommunity/olcrtc/internal/protect"
 )
 
 const (
@@ -29,6 +25,7 @@ const (
 	kaMarker      = "---KA---"
 	slowWrite     = 500 * time.Millisecond
 	echoRingSize  = 4096
+	recvRingSize  = 4096
 	frameLogLimit = 400
 	shapeLogLimit = 6
 	lateLag       = time.Second
@@ -44,37 +41,93 @@ var (
 	userIDRe = regexp.MustCompile(`"id":"([^"]{1,64})"`)
 )
 
+// hashRing is a fixed-size set of recent hashes for echo/duplicate suppression.
+type hashRing struct {
+	mu   sync.Mutex
+	set  map[uint64]struct{}
+	ring []uint64
+	pos  int
+}
+
+func newHashRing(n int) *hashRing {
+	return &hashRing{set: make(map[uint64]struct{}, n), ring: make([]uint64, n)}
+}
+
+func (r *hashRing) add(h uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.insert(h)
+}
+
+func (r *hashRing) insert(h uint64) {
+	if old := r.ring[r.pos]; old != 0 {
+		delete(r.set, old)
+	}
+	r.ring[r.pos] = h
+	r.set[h] = struct{}{}
+	r.pos = (r.pos + 1) % len(r.ring)
+}
+
+func (r *hashRing) has(h uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.set[h]
+	return ok
+}
+
+// addIfNew records h and reports whether it was unseen.
+func (r *hashRing) addIfNew(h uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.set[h]; ok {
+		return false
+	}
+	r.insert(h)
+	return true
+}
+
+func hash64(s string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum64()
+}
+
 type docConn struct {
-	docURL  string
-	st      *stats
-	deliver func([]byte)
-	sendQ   chan []byte
+	docURL   string
+	st       *stats
+	deliver  func([]byte)
+	sendQ    chan []byte
+	baseUser string
 
-	userID string
-
-	mu      sync.Mutex
-	ws      *websocket.Conn
-	writeMu sync.Mutex
-
-	connected    atomic.Bool
 	txData       atomic.Int64
 	lastTxData   atomic.Int64
 	lastRxData   atomic.Int64
 	stallSince   atomic.Int64
-	sessionFrom  atomic.Int64
 	lateLogAt    atomic.Int64
 	participants atomic.Int64
 
-	echoMu   sync.Mutex
-	echoSet  map[uint64]struct{}
-	echoRing []uint64
-	echoPos  int
+	echo *hashRing // our own outgoing payloads, so their broadcast is ignored
+	recv *hashRing // incoming data payloads, deduped across overlapping sessions
 
 	shapesMu   sync.Mutex
 	shapesSeen map[string]int
 
 	probe probeState
+
+	// Supervisor state (see session.go). Guarded by mu; active is read from
+	// the writer/keepalive/probe goroutines, the rest only from the manager.
+	mu       sync.Mutex
+	active   *session
+	sessions map[int]*session
+	nextID   int
+	rotating bool
+	attempt  int
+
+	runCtx context.Context //nolint:containedctx // set once by loop, read by session goroutines
+	events chan sessionEvent
 }
+
+func (c *docConn) participantsSwap(n int64) int64 { return c.participants.Swap(n) }
 
 func newDocConn(docURL string, st *stats, deliver func([]byte)) *docConn {
 	return &docConn{
@@ -82,34 +135,43 @@ func newDocConn(docURL string, st *stats, deliver func([]byte)) *docConn {
 		st:         st,
 		deliver:    deliver,
 		sendQ:      make(chan []byte, queueSize),
-		userID:     fmt.Sprintf("%010d%03d", rand.IntN(1_000_000_000), rand.IntN(1000)), //nolint:gosec // not a secret
-		echoSet:    make(map[uint64]struct{}, echoRingSize),
-		echoRing:   make([]uint64, echoRingSize),
+		baseUser:   fmt.Sprintf("%010d", rand.IntN(1_000_000_000)), //nolint:gosec // not a secret
+		echo:       newHashRing(echoRingSize),
+		recv:       newHashRing(recvRingSize),
 		shapesSeen: map[string]int{},
+		sessions:   map[int]*session{},
+		events:     make(chan sessionEvent, 32),
 	}
 }
 
 func (c *docConn) queueLen() int { return len(c.sendQ) }
 
-func (c *docConn) stateText() string {
-	if !c.connected.Load() {
-		return "down"
-	}
-	return fmt.Sprintf("up%ds", (time.Now().UnixNano()-c.sessionFrom.Load())/int64(time.Second))
+// isUp reports whether a promoted session is ready to carry traffic.
+func (c *docConn) isUp() bool {
+	s := c.currentActive()
+	return s != nil && s.ready.Load()
 }
 
-func (c *docConn) close() {
+func (c *docConn) currentActive() *session {
 	c.mu.Lock()
-	ws := c.ws
-	c.mu.Unlock()
-	if ws != nil {
-		_ = ws.Close()
+	defer c.mu.Unlock()
+	return c.active
+}
+
+func (c *docConn) stateText() string {
+	s := c.currentActive()
+	if s == nil || !s.ready.Load() {
+		return "down"
 	}
+	c.mu.Lock()
+	live := len(c.sessions)
+	c.mu.Unlock()
+	return fmt.Sprintf("up%ds/n%d", int(time.Since(s.startedAt).Seconds()), live)
 }
 
 // send queues one packet payload (already compressed).
 func (c *docConn) send(payload []byte) {
-	if !c.connected.Load() {
+	if !c.isUp() {
 		c.st.notConnDrops.Add(1)
 		return
 	}
@@ -122,167 +184,12 @@ func (c *docConn) send(payload []byte) {
 	}
 }
 
-func (c *docConn) writeText(msg string) error {
-	c.mu.Lock()
-	ws := c.ws
-	c.mu.Unlock()
-	if ws == nil {
-		return websocket.ErrCloseSent
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	started := time.Now()
-	err := ws.WriteMessage(websocket.TextMessage, []byte(msg))
-	took := time.Since(started)
-	c.st.txMaxMs.observe(took.Milliseconds())
-	if took > slowWrite {
-		c.st.txSlow.Add(1)
-	}
-	if err != nil {
-		c.st.txErr.Add(1)
-		return fmt.Errorf("ws write: %w", err)
-	}
-	c.st.txBytes.Add(int64(len(msg)))
-	return nil
-}
-
-func (c *docConn) writer(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case b64 := <-c.sendQ:
-			if !c.connected.Load() {
-				c.st.notConnDrops.Add(1)
-				continue
-			}
-			c.rememberSent(string(b64))
-			if err := c.writeText(cursorPrefix + string(b64) + cursorSuffix); err != nil {
-				continue
-			}
-			c.st.txMsgs.Add(1)
-			c.txData.Add(1)
-			c.lastTxData.Store(time.Now().UnixNano())
-		}
-	}
-}
-
-func (c *docConn) keepAliveLoop(ctx context.Context) {
-	ticker := time.NewTicker(keepAlive)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !c.connected.Load() {
-				continue
-			}
-			if err := c.writeText(cursorPrefix + kaMarker + cursorSuffix); err != nil {
-				logf("openflux: keepalive failed: %v", err)
-				c.close()
-			}
-		}
-	}
-}
-
-// loop keeps one session alive until ctx is cancelled.
-func (c *docConn) loop(ctx context.Context) {
-	attempt := 0
-	for ctx.Err() == nil {
-		lived, err := c.session(ctx)
-		c.connected.Store(false)
-		c.mu.Lock()
-		c.ws = nil
-		c.mu.Unlock()
-		if ctx.Err() != nil {
-			return
-		}
-		if lived > 15*time.Second {
-			attempt = 0
-		}
-		attempt++
-		wait := backoff(attempt)
-		logf("openflux: session ended after %dms: %v; retry #%d in %dms", lived.Milliseconds(), err, attempt,
-			wait.Milliseconds())
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(wait):
-		}
-	}
-}
-
-func backoff(n int) time.Duration {
-	shift := min(max(n-1, 0), 5)
-	d := min(500*time.Millisecond*time.Duration(1<<shift), 15*time.Second)
-	return d + time.Duration(rand.Int64N(int64(d/2)+1)) //nolint:gosec // jitter only
-}
-
-func (c *docConn) session(ctx context.Context) (time.Duration, error) {
-	started := time.Now()
-	info, err := fetchDocInfo(ctx, c.docURL, c.userID)
-	if err != nil {
-		return 0, err
-	}
-	dialer := protect.NewWebSocketDialer(15 * time.Second)
-	headers := http.Header{}
-	headers.Set("User-Agent", "Mozilla/5.0")
-	headers.Set("Origin", info.origin)
-	headers.Set("Cookie", info.cookie)
-	dialStart := time.Now()
-	ws, resp, err := dialer.DialContext(ctx, info.wsURL, headers)
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-	if err != nil {
-		status := 0
-		if resp != nil {
-			status = resp.StatusCode
-		}
-		return 0, fmt.Errorf("ws dial http=%d: %w", status, err)
-	}
-	logf("openflux: ws connected host=%s dial=%dms total=%dms user=%s", shortHost(info.host),
-		time.Since(dialStart).Milliseconds(), time.Since(started).Milliseconds(), c.userID)
-
-	c.mu.Lock()
-	c.ws = ws
-	c.mu.Unlock()
-	msgs, err := authMessages(info, c.userID)
-	if err != nil {
-		return 0, err
-	}
-	for _, m := range msgs {
-		if err := c.writeText(m); err != nil {
-			return 0, err
-		}
-	}
-	c.sessionFrom.Store(time.Now().UnixNano())
-	c.st.connects.Add(1)
-	defer c.st.disconnects.Add(1)
-
-	for {
-		_, data, err := ws.ReadMessage()
-		if err != nil {
-			return time.Since(started), fmt.Errorf("ws read: %w", err)
-		}
-		c.handleFrame(string(data))
-	}
-}
-
-func shortHost(h string) string {
-	if i := strings.Index(h, "."); i > 12 {
-		return h[:12] + "..." + h[i:]
-	}
-	return h
-}
-
-func (c *docConn) handleFrame(frame string) {
+func (c *docConn) handleFrame(s *session, frame string) {
 	c.st.rxFrames.Add(1)
 	c.st.rxBytes.Add(int64(len(frame)))
 	switch frame {
 	case "2":
-		_ = c.writeText("3")
+		_ = s.writeText("3")
 		return
 	case "3":
 		return
@@ -297,10 +204,10 @@ func (c *docConn) handleFrame(frame string) {
 		}
 		c.st.rxOther.Add(1)
 		c.logShape(frameKind(frame), frame)
-		c.handleControl(frame)
+		c.handleControl(s, frame)
 		return
 	}
-	c.markReady("first cursor")
+	c.markReady(s, "first cursor")
 	c.st.rxCursors.Add(int64(len(cursors)))
 	c.observeLag(frame)
 	if len(cursors) > 1 {
@@ -313,7 +220,7 @@ func (c *docConn) handleFrame(frame string) {
 		c.st.notePeer(m[1])
 	}
 	for _, payload := range cursors {
-		c.handleCursor(payload)
+		c.handleCursor(s, payload)
 	}
 }
 
@@ -344,12 +251,13 @@ func extractCursors(frame string) []string {
 // handleControl reacts to auth and participant updates. Data is only sent
 // after auth: Yandex sometimes closes the socket right after the handshake,
 // and packets queued before that are lost silently.
-func (c *docConn) handleControl(frame string) {
+func (c *docConn) handleControl(s *session, frame string) {
 	if strings.Contains(frame, `"type":"auth"`) {
 		if strings.Contains(frame, `"result":1`) {
-			c.markReady("auth")
+			s.authOK.Store(true)
+			c.markReady(s, "auth")
 		} else {
-			logf("openflux: auth not accepted len=%d", len(frame))
+			logf("openflux: session #%d auth not accepted len=%d", s.id, len(frame))
 		}
 	}
 	if strings.Contains(frame, `"type":"waitAuth"`) {
@@ -357,22 +265,18 @@ func (c *docConn) handleControl(frame string) {
 		if m := userIDRe.FindStringSubmatch(frame); len(m) > 1 {
 			holder = m[1]
 		}
-		logf("openflux: waitAuth, document locked by %s", holder)
+		logf("openflux: session #%d waitAuth, document locked by %s", s.id, holder)
 	}
 	if strings.Contains(frame, `"participants":[`) {
+		s.lastCtrl.Store(strPtr("participants"))
 		n := int64(strings.Count(frame, `"connectionId":`))
-		if old := c.participants.Swap(n); old != n {
+		if old := c.participantsSwap(n); old != n {
 			logf("openflux: document participants=%d (was %d)", n, old)
 		}
 	}
 }
 
-func (c *docConn) markReady(reason string) {
-	if c.connected.CompareAndSwap(false, true) {
-		logf("openflux: session ready via %s after %dms", reason,
-			(time.Now().UnixNano()-c.sessionFrom.Load())/int64(time.Millisecond))
-	}
-}
+func strPtr(s string) *string { return &s }
 
 func frameKind(frame string) string {
 	if m := typeRe.FindStringSubmatch(frame); len(m) > 1 {
@@ -403,17 +307,23 @@ func (c *docConn) logShape(kind, frame string) {
 	logf("openflux: frame %s #%d len=%d %s", kind, n+1, len(frame), clean)
 }
 
-func (c *docConn) handleCursor(payload string) {
+func (c *docConn) handleCursor(s *session, payload string) {
 	if strings.Contains(payload, kaMarker) {
-		if c.handleProbe(payload) {
+		if c.handleProbe(s, payload) {
 			c.st.rxProbe.Add(1)
 			return
 		}
 		c.st.rxKA.Add(1)
 		return
 	}
-	if c.isEcho(payload) {
+	if c.echo.has(hash64(payload)) {
 		c.st.rxEcho.Add(1)
+		return
+	}
+	// The exit node's reply is broadcast to every participant, so both of our
+	// overlapping sessions see it. Deliver each payload to the device once.
+	if !c.recv.addIfNew(hash64(payload)) {
+		c.st.rxDup.Add(1)
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(payload)
@@ -460,35 +370,10 @@ func (c *docConn) observeLag(frame string) {
 	}
 }
 
-func hash64(s string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(s))
-	return h.Sum64()
-}
-
-func (c *docConn) rememberSent(b64 string) {
-	h := hash64(b64)
-	c.echoMu.Lock()
-	defer c.echoMu.Unlock()
-	if old := c.echoRing[c.echoPos]; old != 0 {
-		delete(c.echoSet, old)
-	}
-	c.echoRing[c.echoPos] = h
-	c.echoSet[h] = struct{}{}
-	c.echoPos = (c.echoPos + 1) % echoRingSize
-}
-
-func (c *docConn) isEcho(b64 string) bool {
-	h := hash64(b64)
-	c.echoMu.Lock()
-	defer c.echoMu.Unlock()
-	_, ok := c.echoSet[h]
-	return ok
-}
-
 // checkStall logs once when data keeps leaving but nothing comes back.
 func (c *docConn) checkStall(now time.Time) {
-	if !c.connected.Load() || c.stallSince.Load() != 0 {
+	s := c.currentActive()
+	if s == nil || !s.ready.Load() || c.stallSince.Load() != 0 {
 		return
 	}
 	tx := c.lastTxData.Load()
@@ -496,7 +381,7 @@ func (c *docConn) checkStall(now time.Time) {
 	if tx == 0 || now.UnixNano()-tx > int64(stallTimeout) {
 		return
 	}
-	if silent := now.UnixNano() - max(rx, c.sessionFrom.Load()); silent > int64(stallTimeout) {
+	if silent := now.UnixNano() - max(rx, s.startedAt.UnixNano()); silent > int64(stallTimeout) {
 		c.stallSince.Store(now.UnixNano() - silent)
 		logf("openflux: stall rx silent %dms while tx active, sendq=%d", silent/int64(time.Millisecond),
 			len(c.sendQ))

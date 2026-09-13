@@ -103,9 +103,9 @@ func (t *Tunnel) Stop() {
 	logf("openflux: stopped %s", t.st.totals())
 }
 
-// Connected reports whether the document websocket is up.
+// Connected reports whether a document session is ready to carry traffic.
 func (t *Tunnel) Connected() bool {
-	return t.conn.connected.Load()
+	return t.conn.isUp()
 }
 
 // WritePacket accepts one IPv4 packet from the device.

@@ -104,9 +104,20 @@ func TestFlowRetransmissions(t *testing.T) {
 
 func TestEchoDetection(t *testing.T) {
 	c := newDocConn("https://example", newStats(), func([]byte) {})
-	c.rememberSent("QUJD")
-	if !c.isEcho("QUJD") || c.isEcho("REVG") {
+	c.echo.add(hash64("QUJD"))
+	if !c.echo.has(hash64("QUJD")) || c.echo.has(hash64("REVG")) {
 		t.Fatal("echo detection broken")
+	}
+}
+
+func TestIncomingDedup(t *testing.T) {
+	r := newHashRing(8)
+	h := hash64("payload")
+	if !r.addIfNew(h) {
+		t.Fatal("first occurrence must be new")
+	}
+	if r.addIfNew(h) {
+		t.Fatal("second occurrence must be a duplicate")
 	}
 }
 

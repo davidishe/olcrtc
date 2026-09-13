@@ -73,14 +73,14 @@ func (c *docConn) probeLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if c.connected.Load() {
-				c.sendProbe()
+			if s := c.currentActive(); s != nil && s.ready.Load() {
+				c.sendProbe(s)
 			}
 		}
 	}
 }
 
-func (c *docConn) sendProbe() {
+func (c *docConn) sendProbe(s *session) {
 	p := &c.probe
 	now := time.Now()
 	sent := c.txData.Load()
@@ -98,13 +98,14 @@ func (c *docConn) sendProbe() {
 	}
 	p.mu.Unlock()
 	msg := fmt.Sprintf("%sP1:c:%d:%d:%d:%d", kaMarker, seq, now.UnixMilli(), sent, c.st.rxData.Load())
-	if c.writeText(cursorPrefix+msg+cursorSuffix) == nil {
+	if s.writeText(cursorPrefix+msg+cursorSuffix) == nil {
 		c.st.probeSent.Add(1)
 	}
 }
 
-// handleProbe reports whether payload was a probe.
-func (c *docConn) handleProbe(payload string) bool {
+// handleProbe reports whether payload was a probe. Replies go out on the same
+// session the probe arrived on.
+func (c *docConn) handleProbe(s *session, payload string) bool {
 	kind, side, r, ok := parseProbe(payload)
 	if !ok {
 		return false
@@ -117,7 +118,7 @@ func (c *docConn) handleProbe(payload string) bool {
 	now := time.Now()
 	if kind == "P1" {
 		reply := fmt.Sprintf("%sR1:c:%d:%d:%d:%d", kaMarker, r.seq, r.ms, c.txData.Load(), c.st.rxData.Load())
-		_ = c.writeText(cursorPrefix + reply + cursorSuffix)
+		_ = s.writeText(cursorPrefix + reply + cursorSuffix)
 		c.onPeerProbe(r)
 		return true
 	}
@@ -141,7 +142,7 @@ func (c *docConn) onReply(r probeReply, now time.Time) {
 	c.st.probeRttTotal.Add(rtt)
 	c.st.probeRttMax.observe(rtt)
 	r.localSent = sample.dataSent
-	if prev := p.lastReply; prev != nil && r.localSent > prev.localSent {
+	if prev := p.lastReply; prev != nil {
 		p.upText = lossText("up", r.localSent-prev.localSent, r.recv-prev.recv)
 	}
 	p.lastReply = &r
@@ -156,7 +157,7 @@ func (c *docConn) onPeerProbe(r probeReply) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	r.localRecvAtArr = c.st.rxData.Load()
-	if prev := p.lastPeer; prev != nil && r.sent > prev.sent {
+	if prev := p.lastPeer; prev != nil {
 		p.dnText = lossText("dn", r.sent-prev.sent, r.localRecvAtArr-prev.localRecvAtArr)
 	}
 	p.lastPeer = &r
@@ -173,7 +174,14 @@ func (p *probeState) summary() string {
 	return strings.Join(parts, " ")
 }
 
+// lossText compares what one side sent with what the other side received
+// between two probes. Either counter resets when a peer restarts, so a window
+// with non-positive or impossible values is reported as unknown instead of a
+// nonsense percentage.
 func lossText(dir string, sent, got int64) string {
+	if sent <= 0 || got < 0 || got > sent {
+		return fmt.Sprintf("%s_loss=? (%d/%d)", dir, got, sent)
+	}
 	loss := float64(sent-got) * 100 / float64(sent)
 	return fmt.Sprintf("%s_loss=%.1f%%(%d/%d)", dir, loss, got, sent)
 }

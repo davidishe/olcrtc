@@ -75,6 +75,42 @@ func TestLiveProbe(t *testing.T) {
 	}
 }
 
+// TestLiveRotation keeps a tunnel up long enough to see at least one seamless
+// session rotation and confirms the active path never drops to nil.
+func TestLiveRotation(t *testing.T) {
+	docURL := os.Getenv("OPENFLUX_DOC_URL")
+	if docURL == "" {
+		t.Skip("OPENFLUX_DOC_URL not set")
+	}
+	tun, err := Start(docURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Stop()
+
+	deadline := time.Now().Add(70 * time.Second)
+	drops := 0
+	sawUp := false
+	for time.Now().Before(deadline) {
+		if tun.Connected() {
+			sawUp = true
+		} else if sawUp {
+			drops++ // active path was nil after having been up
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	line, _ := tun.st.snapshot(tun.conn, 0, 0)
+	t.Logf("after 70s: %s", line)
+	if !sawUp {
+		t.Fatal("never connected")
+	}
+	// A rotation replaces the active session before the old one dies, so a
+	// brief nil window is tolerated but should be rare.
+	if drops > 5 {
+		t.Fatalf("active path dropped %d times; rotation not seamless", drops)
+	}
+}
+
 func tcpChecksum(p []byte) uint16 {
 	seg := p[20:]
 	pseudo := make([]byte, 12+len(seg))

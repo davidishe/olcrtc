@@ -66,6 +66,7 @@ type stats struct {
 
 	// websocket read side
 	rxFrames, rxBytes, rxCursors, rxMulti, rxData, rxEcho  atomic.Int64
+	rxDup                                                  atomic.Int64
 	rxKA, rxProbe, rxOther, rxDecodeErr, rxDecompErr, rxSC atomic.Int64
 
 	// Yandex delivery lag: receive time minus the server "time" stamp
@@ -134,6 +135,7 @@ func (s *stats) named() []struct {
 		{"tx", "slow", &s.txSlow},
 		{"rx", "frames", &s.rxFrames}, {"rx", "bytes", &s.rxBytes}, {"rx", "cursors", &s.rxCursors},
 		{"rx", "multi", &s.rxMulti}, {"rx", "data", &s.rxData}, {"rx", "echo", &s.rxEcho},
+		{"rx", "dup", &s.rxDup},
 		{"rx", "ka", &s.rxKA}, {"rx", "probe", &s.rxProbe}, {"rx", "other", &s.rxOther},
 		{"rx", "b64err", &s.rxDecodeErr}, {"rx", "lz4err", &s.rxDecompErr}, {"rx", "savechg", &s.rxSC},
 		{"rx", "late", &s.lagLate},
