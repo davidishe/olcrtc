@@ -130,3 +130,50 @@ func TestICMPChecksum(t *testing.T) {
 		t.Fatal("checksums must verify to zero")
 	}
 }
+
+// dnsQuery builds a minimal A query for name with the given transaction id.
+func dnsQuery(name string, id uint16) []byte {
+	msg := make([]byte, 12)
+	binary.BigEndian.PutUint16(msg[0:2], id)
+	binary.BigEndian.PutUint16(msg[2:4], 0x0100) // recursion desired
+	binary.BigEndian.PutUint16(msg[4:6], 1)      // one question
+	for _, label := range strings.Split(name, ".") {
+		msg = append(msg, byte(len(label)))
+		msg = append(msg, label...)
+	}
+	msg = append(msg, 0)
+	msg = append(msg, 0, 1, 0, 1) // A, IN
+	return msg
+}
+
+func TestDNSCacheKeyIgnoresTransactionID(t *testing.T) {
+	a, ok := cacheKey(dnsQuery("example.com", 1))
+	if !ok {
+		t.Fatal("question must parse")
+	}
+	b, _ := cacheKey(dnsQuery("example.com", 2))
+	if a != b {
+		t.Fatal("same question with a different id must share the cache key")
+	}
+	c, _ := cacheKey(dnsQuery("other.com", 1))
+	if a == c {
+		t.Fatal("different names must not share a key")
+	}
+}
+
+func TestDNSCacheRestoresTransactionID(t *testing.T) {
+	r := newDNSResolver(newStats())
+	query := dnsQuery("example.com", 0x1234)
+	answer := append([]byte(nil), query...)
+	binary.BigEndian.PutUint16(answer[6:8], 1) // pretend one answer record
+	r.store(query, answer)
+
+	again := dnsQuery("example.com", 0xbeef)
+	got, ok := r.fromCache(again)
+	if !ok {
+		t.Fatal("second query must hit the cache")
+	}
+	if binary.BigEndian.Uint16(got[0:2]) != 0xbeef {
+		t.Fatalf("cached answer must carry the asking id, got %x", got[0:2])
+	}
+}

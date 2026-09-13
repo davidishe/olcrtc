@@ -78,6 +78,7 @@ type stats struct {
 
 	// dns
 	dnsQ, dnsOK, dnsFail, dnsDrop, dnsMsTotal atomic.Int64
+	dnsCacheHit                               atomic.Int64
 	dnsMsMax                                  maxGauge
 
 	// probes
@@ -141,7 +142,7 @@ func (s *stats) named() []struct {
 		{"rx", "late", &s.lagLate},
 		{"ws", "connects", &s.connects}, {"ws", "drops", &s.disconnects},
 		{"dns", "q", &s.dnsQ}, {"dns", "ok", &s.dnsOK}, {"dns", "fail", &s.dnsFail},
-		{"dns", "busy", &s.dnsDrop},
+		{"dns", "busy", &s.dnsDrop}, {"dns", "cached", &s.dnsCacheHit},
 		{"probe", "sent", &s.probeSent}, {"probe", "replies", &s.probeRecv},
 	}
 }

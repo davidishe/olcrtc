@@ -99,6 +99,7 @@ func (t *Tunnel) run(ctx context.Context, fn func(context.Context)) {
 func (t *Tunnel) Stop() {
 	t.cancel()
 	t.conn.close()
+	t.dns.closeAll()
 	t.done.Wait()
 	logf("openflux: stopped %s", t.st.totals())
 }

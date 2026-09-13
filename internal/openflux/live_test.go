@@ -121,3 +121,58 @@ func tcpChecksum(p []byte) uint16 {
 	copy(pseudo[12:], seg)
 	return ipChecksum(pseudo)
 }
+
+// TestLiveDNS resolves real names through the pooled DoT path and checks that
+// the second lookup is served from cache.
+func TestLiveDNS(t *testing.T) {
+	r := newDNSResolver(newStats())
+	defer r.closeAll()
+
+	ask := func(name string) (time.Duration, bool) {
+		query := dnsQuery(name, 0x4242)
+		pkt := make([]byte, 28+len(query))
+		pkt[0] = 0x45
+		binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
+		pkt[9] = protoUDP
+		copy(pkt[12:16], []byte{10, 10, 10, 2})
+		copy(pkt[16:20], []byte{198, 18, 0, 1})
+		binary.BigEndian.PutUint16(pkt[20:22], 51234)
+		binary.BigEndian.PutUint16(pkt[22:24], 53)
+		copy(pkt[28:], query)
+
+		done := make(chan []byte, 1)
+		started := time.Now()
+		r.handle(pkt, func(resp []byte) { done <- resp })
+		select {
+		case resp := <-done:
+			if binary.BigEndian.Uint16(resp[28:30]) != 0x4242 {
+				t.Fatal("answer must carry the asking transaction id")
+			}
+			return time.Since(started), true
+		case <-time.After(10 * time.Second):
+			return 0, false
+		}
+	}
+
+	first, ok := ask("example.com")
+	if !ok {
+		t.Fatal("no answer for example.com")
+	}
+	second, ok := ask("example.com")
+	if !ok {
+		t.Fatal("no cached answer")
+	}
+	third, ok := ask("ya.ru")
+	if !ok {
+		t.Fatal("no answer for ya.ru")
+	}
+	t.Logf("first=%dms cached=%dms pooled=%dms hits=%d fails=%d",
+		first.Milliseconds(), second.Milliseconds(), third.Milliseconds(),
+		r.st.dnsCacheHit.Load(), r.st.dnsFail.Load())
+	if second > 20*time.Millisecond {
+		t.Fatalf("cached lookup took %dms", second.Milliseconds())
+	}
+	if third > first {
+		t.Logf("note: pooled lookup was not faster than the first one")
+	}
+}
