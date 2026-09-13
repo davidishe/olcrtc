@@ -6,6 +6,7 @@ package openflux
 
 import (
 	"encoding/binary"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -182,6 +183,8 @@ func (f *flowTable) observeDown(pkt []byte, st *stats) {
 	switch {
 	case info.flags&tcpRST != 0:
 		st.rstDn.Add(1)
+		st.noteRST(fmt.Sprintf("%d.%d.%d.%d:%d", info.remote[0], info.remote[1], info.remote[2],
+			info.remote[3], info.remotePort))
 	case info.flags&(tcpSYN|tcpACK) == tcpSYN|tcpACK:
 		st.synAckDn.Add(1)
 	}

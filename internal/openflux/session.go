@@ -14,6 +14,7 @@ package openflux
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -379,18 +380,25 @@ func (c *docConn) writer(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case b64 := <-c.sendQ:
+		case first := <-c.sendQ:
 			s := c.currentActive()
 			if s == nil || !s.ready.Load() {
 				c.st.notConnDrops.Add(1)
 				continue
 			}
-			c.echo.add(hash64(string(b64)))
-			if err := s.writeText(cursorPrefix + string(b64) + cursorSuffix); err != nil {
+			units := c.drainQueue(first)
+			payload := units[0]
+			if len(units) > 1 {
+				payload = encodeBatch(units)
+				c.st.txBatch.Add(1)
+			}
+			b64 := base64.StdEncoding.EncodeToString(payload)
+			c.echo.add(hash64(b64))
+			if err := s.writeText(cursorPrefix + b64 + cursorSuffix); err != nil {
 				continue
 			}
 			c.st.txMsgs.Add(1)
-			c.txData.Add(1)
+			c.txData.Add(int64(len(units)))
 			c.lastTxData.Store(time.Now().UnixNano())
 		}
 	}
@@ -414,6 +422,23 @@ func (c *docConn) keepAliveLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// drainQueue takes everything already queued, up to the batch limits. It never
+// waits: a quiet tunnel still sends each packet immediately.
+func (c *docConn) drainQueue(first []byte) [][]byte {
+	units := [][]byte{first}
+	total := len(first) + 2
+	for len(units) < maxBatchUnits && total < maxBatchBytes {
+		select {
+		case next := <-c.sendQ:
+			units = append(units, next)
+			total += len(next) + 2
+		default:
+			return units
+		}
+	}
+	return units
 }
 
 func backoff(n int) time.Duration {

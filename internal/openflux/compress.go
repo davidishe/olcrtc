@@ -6,6 +6,7 @@ package openflux
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 
@@ -14,11 +15,71 @@ import (
 
 // Wire compatibility with upstream OpenFlux: 0x00 prefix means raw bytes,
 // 0x1F prefix means an lz4 frame. Payloads up to minCompress stay raw.
+//
+// 0x42 is a Cockney extension: one message carrying several units, each a
+// length-prefixed 0x00/0x1F payload. The document relays roughly 300 messages
+// per second regardless of their size, so one packet per message capped the
+// tunnel at about 1 Mbit/s. Upstream OpenFlux cannot read a batch; the exit
+// node must run the Cockney patch.
 const (
 	markerRaw   = 0x00
 	markerLZ4   = 0x1F
+	markerBatch = 0x42
 	minCompress = 200
+
+	maxBatchUnits = 32
+	maxBatchBytes = 24000 // base64 inflates this to ~32 KB per message
 )
+
+var errBatchTruncated = errors.New("batch unit truncated")
+
+// encodeBatch packs several compressed units into one payload.
+func encodeBatch(units [][]byte) []byte {
+	total := 1
+	for _, u := range units {
+		total += 2 + len(u)
+	}
+	out := make([]byte, 0, total)
+	out = append(out, markerBatch)
+	for _, u := range units {
+		out = append(out, byte(len(u)>>8), byte(len(u)))
+		out = append(out, u...)
+	}
+	return out
+}
+
+// decodeUnits returns every packet carried by one payload, batched or not.
+func decodeUnits(payload []byte) ([][]byte, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	if payload[0] != markerBatch {
+		pkt, err := decompress(payload)
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{pkt}, nil
+	}
+	var out [][]byte
+	rest := payload[1:]
+	for len(rest) > 0 {
+		if len(rest) < 2 {
+			return out, errBatchTruncated
+		}
+		n := int(rest[0])<<8 | int(rest[1])
+		rest = rest[2:]
+		if n > len(rest) {
+			return out, errBatchTruncated
+		}
+		pkt, err := decompress(rest[:n])
+		if err != nil {
+			return out, err
+		}
+		out = append(out, pkt)
+		rest = rest[n:]
+	}
+	return out, nil
+}
 
 func compress(data []byte) []byte {
 	if len(data) > minCompress {

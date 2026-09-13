@@ -169,15 +169,15 @@ func (c *docConn) stateText() string {
 	return fmt.Sprintf("up%ds/n%d", int(time.Since(s.startedAt).Seconds()), live)
 }
 
-// send queues one packet payload (already compressed).
-func (c *docConn) send(payload []byte) {
+// send queues one compressed unit. Units are base64-encoded together when the
+// writer drains them, so a busy queue turns into one message per batch.
+func (c *docConn) send(unit []byte) {
 	if !c.isUp() {
 		c.st.notConnDrops.Add(1)
 		return
 	}
-	b64 := base64.StdEncoding.EncodeToString(payload)
 	select {
-	case c.sendQ <- []byte(b64):
+	case c.sendQ <- unit:
 		c.st.sendQHigh.observe(int64(len(c.sendQ)))
 	default:
 		c.st.sendQDrops.Add(1)
@@ -331,18 +331,25 @@ func (c *docConn) handleCursor(s *session, payload string) {
 		c.st.rxDecodeErr.Add(1)
 		return
 	}
-	pkt, err := decompress(raw)
+	pkts, err := decodeUnits(raw)
 	if err != nil {
 		c.st.rxDecompErr.Add(1)
-		return
+		if len(pkts) == 0 {
+			return
+		}
 	}
-	c.st.rxData.Add(1)
+	if len(pkts) > 1 {
+		c.st.rxBatch.Add(1)
+	}
+	c.st.rxData.Add(int64(len(pkts)))
 	now := time.Now().UnixNano()
 	c.lastRxData.Store(now)
 	if since := c.stallSince.Swap(0); since != 0 {
 		logf("openflux: stall over after %dms", (now-since)/int64(time.Millisecond))
 	}
-	c.deliver(pkt)
+	for _, pkt := range pkts {
+		c.deliver(pkt)
+	}
 }
 
 // observeLag compares Yandex server stamps with local receive time. Large

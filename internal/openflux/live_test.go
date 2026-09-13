@@ -176,3 +176,65 @@ func TestLiveDNS(t *testing.T) {
 		t.Logf("note: pooled lookup was not faster than the first one")
 	}
 }
+
+// TestLiveBatch floods the tunnel with connection attempts and checks that
+// both sides pack several packets into one document message.
+func TestLiveBatch(t *testing.T) {
+	docURL := os.Getenv("OPENFLUX_DOC_URL")
+	if docURL == "" {
+		t.Skip("OPENFLUX_DOC_URL not set")
+	}
+	tun, err := Start(docURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Stop()
+
+	deadline := time.Now().Add(40 * time.Second)
+	for !tun.Connected() && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !tun.Connected() {
+		t.Fatal("websocket did not connect")
+	}
+
+	// Drain whatever comes back so the device queue never fills.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				tun.ReadPacket(200 * time.Millisecond)
+			}
+		}
+	}()
+	defer close(stop)
+
+	dev := [4]byte{10, 10, 10, 2}
+	dst := [4]byte{1, 1, 1, 1}
+	for i := range 300 {
+		syn := tcpPacket(dev, dst, uint16(30000+i), 80, rand.Uint32(), tcpSYN, 0)
+		binary.BigEndian.PutUint16(syn[34:36], 65535)
+		binary.BigEndian.PutUint16(syn[10:12], ipChecksum(syn[:20]))
+		binary.BigEndian.PutUint16(syn[36:38], tcpChecksum(syn))
+		tun.WritePacket(syn)
+	}
+	time.Sleep(6 * time.Second)
+
+	line, _ := tun.st.snapshot(tun.conn, 0, 0)
+	t.Logf("%s", line)
+	txMsgs, txPkts := tun.st.txMsgs.Load(), tun.conn.txData.Load()
+	t.Logf("tx msgs=%d packets=%d batched=%d | rx packets=%d batched=%d",
+		txMsgs, txPkts, tun.st.txBatch.Load(), tun.st.rxData.Load(), tun.st.rxBatch.Load())
+	if tun.st.txBatch.Load() == 0 {
+		t.Fatal("300 packets at once must produce at least one batch")
+	}
+	if txPkts <= txMsgs {
+		t.Fatalf("batching did not reduce message count: %d packets in %d messages", txPkts, txMsgs)
+	}
+	if tun.st.rxBatch.Load() == 0 {
+		t.Log("note: exit node sent no batch (few replies?)")
+	}
+}

@@ -177,3 +177,49 @@ func TestDNSCacheRestoresTransactionID(t *testing.T) {
 		t.Fatalf("cached answer must carry the asking id, got %x", got[0:2])
 	}
 }
+
+func TestBatchRoundTrip(t *testing.T) {
+	one := compress([]byte("first packet"))
+	two := compress(bytes.Repeat([]byte("second packet "), 40))
+	three := compress([]byte("third"))
+
+	single, err := decodeUnits(one)
+	if err != nil || len(single) != 1 || string(single[0]) != "first packet" {
+		t.Fatalf("single unit must still decode: %v %q", err, single)
+	}
+
+	batch := encodeBatch([][]byte{one, two, three})
+	if batch[0] != markerBatch {
+		t.Fatalf("batch marker missing: %x", batch[0])
+	}
+	pkts, err := decodeUnits(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkts) != 3 || string(pkts[0]) != "first packet" || string(pkts[2]) != "third" {
+		t.Fatalf("bad batch contents: %d units", len(pkts))
+	}
+	if !bytes.Equal(pkts[1], bytes.Repeat([]byte("second packet "), 40)) {
+		t.Fatal("compressed unit inside a batch must survive")
+	}
+
+	if _, err := decodeUnits([]byte{markerBatch, 0x00}); err == nil {
+		t.Fatal("truncated batch must fail")
+	}
+}
+
+func TestDrainQueueRespectsLimits(t *testing.T) {
+	c := newDocConn("https://example", newStats(), func([]byte) {})
+	for i := 0; i < maxBatchUnits+10; i++ {
+		c.sendQ <- []byte("unit")
+	}
+	units := c.drainQueue([]byte("first"))
+	if len(units) != maxBatchUnits {
+		t.Fatalf("expected %d units, got %d", maxBatchUnits, len(units))
+	}
+	// A quiet queue must not wait for more.
+	drained := c.drainQueue([]byte("solo"))
+	if len(drained) == 0 {
+		t.Fatal("drain must always return the first unit")
+	}
+}

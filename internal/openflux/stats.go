@@ -61,12 +61,12 @@ type stats struct {
 	outQHigh                                                         maxGauge
 
 	// websocket write side
-	txMsgs, txBytes, txErr, txSlow atomic.Int64
-	txMaxMs                        maxGauge
+	txMsgs, txBytes, txErr, txSlow, txBatch atomic.Int64
+	txMaxMs                                 maxGauge
 
 	// websocket read side
 	rxFrames, rxBytes, rxCursors, rxMulti, rxData, rxEcho  atomic.Int64
-	rxDup                                                  atomic.Int64
+	rxDup, rxBatch                                         atomic.Int64
 	rxKA, rxProbe, rxOther, rxDecodeErr, rxDecompErr, rxSC atomic.Int64
 
 	// Yandex delivery lag: receive time minus the server "time" stamp
@@ -86,6 +86,7 @@ type stats struct {
 	probeRttMax                         maxGauge
 
 	mu       sync.Mutex
+	rstPeers map[string]int64
 	peers    map[string]struct{}
 	known    map[string]struct{}
 	prev     map[string]int64
@@ -94,7 +95,12 @@ type stats struct {
 }
 
 func newStats() *stats {
-	return &stats{peers: map[string]struct{}{}, known: map[string]struct{}{}, prev: map[string]int64{}}
+	return &stats{
+		peers:    map[string]struct{}{},
+		known:    map[string]struct{}{},
+		prev:     map[string]int64{},
+		rstPeers: map[string]int64{},
+	}
 }
 
 func (s *stats) notePeer(id string) {
@@ -106,6 +112,41 @@ func (s *stats) notePeer(id string) {
 	if !seen {
 		logf("openflux: peer seen user=%s", id)
 	}
+}
+
+// noteRST remembers which remote reset a connection, so a burst of resets
+// names the service instead of just counting.
+func (s *stats) noteRST(addr string) {
+	s.mu.Lock()
+	if len(s.rstPeers) < 64 {
+		s.rstPeers[addr]++
+	}
+	s.mu.Unlock()
+}
+
+// topRST renders the worst offenders of the window and clears the tally.
+func (s *stats) topRST(limit int) string {
+	if len(s.rstPeers) == 0 {
+		return ""
+	}
+	type pair struct {
+		addr string
+		n    int64
+	}
+	pairs := make([]pair, 0, len(s.rstPeers))
+	for a, n := range s.rstPeers {
+		pairs = append(pairs, pair{a, n})
+	}
+	s.rstPeers = map[string]int64{}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].n > pairs[j].n })
+	parts := make([]string, 0, limit)
+	for i, p := range pairs {
+		if i == limit {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%sx%d", p.addr, p.n))
+	}
+	return strings.Join(parts, " ")
 }
 
 func (s *stats) setProbeText(txt string) {
@@ -133,10 +174,10 @@ func (s *stats) named() []struct {
 		{"dn", "synack", &s.synAckDn}, {"dn", "rst", &s.rstDn}, {"dn", "fin", &s.finDn},
 		{"dn", "zwin", &s.zeroWinDn}, {"dn", "qdrop", &s.outQDrops},
 		{"tx", "msgs", &s.txMsgs}, {"tx", "bytes", &s.txBytes}, {"tx", "err", &s.txErr},
-		{"tx", "slow", &s.txSlow},
+		{"tx", "slow", &s.txSlow}, {"tx", "batch", &s.txBatch},
 		{"rx", "frames", &s.rxFrames}, {"rx", "bytes", &s.rxBytes}, {"rx", "cursors", &s.rxCursors},
 		{"rx", "multi", &s.rxMulti}, {"rx", "data", &s.rxData}, {"rx", "echo", &s.rxEcho},
-		{"rx", "dup", &s.rxDup},
+		{"rx", "dup", &s.rxDup}, {"rx", "batch", &s.rxBatch},
 		{"rx", "ka", &s.rxKA}, {"rx", "probe", &s.rxProbe}, {"rx", "other", &s.rxOther},
 		{"rx", "b64err", &s.rxDecodeErr}, {"rx", "lz4err", &s.rxDecompErr}, {"rx", "savechg", &s.rxSC},
 		{"rx", "late", &s.lagLate},
@@ -200,6 +241,9 @@ func (s *stats) snapshot(c *docConn, outQLen, flows int) (string, bool) {
 		fmt.Fprintf(&b, " | %s", s.probeTxt)
 	case s.probeSent.Load() > 0:
 		b.WriteString(" | probe no replies (exit node without diagnostics?)")
+	}
+	if top := s.topRST(3); top != "" {
+		fmt.Fprintf(&b, " | rst %s", top)
 	}
 	if len(s.peers) > 0 {
 		ids := make([]string, 0, len(s.peers))
